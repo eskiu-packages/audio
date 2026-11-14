@@ -153,9 +153,37 @@ A sound field has four channels in AmbiX order (W, Y, Z, X: y to the left, z up,
 The mixer decodes it to two cardioid microphones pointing to the listener's ears, so it
 turns as the listener turns; `Mixer_set_field_rotation` turns the field itself.
 
-ViroReact renders spatial sound binaurally (head-related filters for headphones, height and
-front or back) and can add room reverb. This mixer pans in stereo, so a sound ahead and one
-behind sound alike, and has no rooms.
+### Binaural and rooms
+
+By default the mixer pans in stereo, so a sound ahead and one behind sound alike.
+`Mixer_set_binaural(true)` renders them as ViroReact does through Resonance Audio, for
+headphones: each positioned sound is encoded into third-order ambisonics from its direction
+around the listener's head, sound fields join it turned into the listener's axes, and the
+sum is convolved with the spherical-harmonic head-related impulse responses of the SADIE
+database (a KU100 dummy head, Resonance's set: `<audio/hrir>`), so a sound is heard ahead or
+behind, above or below. The work is a fixed cost per block of 256 frames (sixteen FFTs),
+whatever the number of sounds.
+
+`Mixer_set_room(true, room)` puts the listener in a shoebox room (ViroReact's
+`ViroSoundRoom`):
+
+```eskiu
+AudioRoom hall = audio_room(12.0, 4.0, 20.0, AudioPlasterSmooth, AudioParquetOnConcrete, AudioWoodCeiling);
+m.set_binaural(true);
+m.set_room(true, hall);
+```
+
+`audio_room` takes the size and the materials of the walls, floor and ceiling (Resonance's
+24, `AudioMaterial`); `position` places it and `reflection_scalar`, `reverb_gain`,
+`reverb_time` and `reverb_brightness` adjust it as Resonance's room properties do. From them
+come, as in Resonance: each surface's early reflection (its round trip from the listener,
+arriving from its direction, weakened by the surface's absorption at 500 Hz to 2 kHz), and
+the reverb's time in nine octave bands by Eyring's formula with air absorption
+(`AudioRoom_rt60`). A sound outside the room feeds its effects less, by 1 / (1 + d)^2 with d
+its distance to the room (`AudioRoom_gain`). The reverb itself is a feedback delay network
+whose decay and damping follow the room's middle and top RT60s, not Resonance's spectral
+reverb, so its color differs while its length matches. Without binaural, rooms still add
+their reverb and reflections to the stereo mix.
 
 ## Recording: offline mixing
 

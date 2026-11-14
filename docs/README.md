@@ -48,7 +48,9 @@ stream whose output goes away (headphones unplugged) opens again on the new one.
 | `<audio/wav>` | `Sound` (with its loop points), `wav_load`, `wav_decode`, `wav_save`, `sound_new` |
 | `<audio/ogg>` | `ogg_load`, `ogg_decode`; `OggVorbis` (`ogg_open`, `ogg_open_memory`, `read`, `seek`, `tell`); `OggStream` (`ogg_stream`, `ogg_stream_from`, `render`, `done`, `seek`, `position`), an `AudioSource` |
 | `<audio/decode>` | `sound_load` and `sound_decode`: WAV and Ogg Vorbis everywhere; MP3, AAC / M4A and FLAC (and Opus on Android) through the system's codecs on iOS and Android |
-| `<audio/mixer>` | `Mixer`, `mixer_new`, `play`, `play_source`, `then`, `stop`, `pause`, `resume`, `seek`, `position`, `current`, `set_volume`, `set_pan`, `set_pitch`, `render`, `AudioPlay`, `AudioSource`; buses (`add_bus`, `set_bus`, `set_bus_volume`, `fade_bus`, `bus_volume`); fades (`fade`, `fade_in`, `fade_out`, `crossfade`, `fade_level`); roles (`use_bgm`, `stop_bgm`, `use_me`, `use_bgs`, `stop_bgs`, `bgm`, `me`, `bgs`); `set_mono`, `set_manual_clock`, `advance` |
+| `<audio/mixer>` | `Mixer`, `mixer_new`, `play`, `play_source`, `then`, `stop`, `pause`, `resume`, `seek`, `position`, `current`, `set_volume`, `set_pan`, `set_pitch`, `render`, `AudioPlay`, `AudioSource`; buses (`add_bus`, `set_bus`, `set_bus_volume`, `fade_bus`, `bus_volume`); fades (`fade`, `fade_in`, `fade_out`, `crossfade`, `fade_level`); roles (`use_bgm`, `stop_bgm`, `use_me`, `use_bgs`, `stop_bgs`, `bgm`, `me`, `bgs`); `set_mono`, `set_manual_clock`, `advance`; in space: `play_at`, `play_field`, `set_listener`, `set_binaural`, `set_room` |
+| `<audio/binaural>` | the binaural renderer and rooms: `AudioRoom`, `audio_room`, `AudioMaterial`, `AudioRoom_rt60`, `AudioRoom_gain`, `audio_sh_coeffs` |
+| `<audio/hrir>` | the SADIE spherical-harmonic HRIRs (Resonance Audio's, Apache 2.0) |
 | `<audio/device>` | `AudioDevice`, `audio_open`, `audio_open_with`, `AudioOptions`, `write`, `queued`, `pump`, `pause`, `resume`, `clear` (SDL3 on the desktop) |
 
 In a ui app, a sound in the app's `assets/` loads by the path ui's `ui_asset_path` gives (in

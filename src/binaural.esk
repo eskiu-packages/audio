@@ -1,0 +1,498 @@
+// binaural.esk: sound in space for headphones and rooms, as ViroReact renders it through
+// Resonance Audio (GVR audio): positioned sounds encoded into third-order ambisonics (ACN,
+// SN3D) and decoded binaurally by convolving each channel with its spherical-harmonic HRIR
+// (SADIE's KU100, hrir.esk), the room's early reflections (a shoebox around the listener,
+// Resonance's model) and its reverb, timed by the RT60 the room's size and materials give
+// (Eyring, Resonance's material table). The mixer uses it when Mixer_set_binaural or
+// Mixer_set_room turns it on (mixer.esk).
+
+import <mem>;
+import <math>;
+import <libc>;
+import <audio/hrir>;
+
+const int _BIN_BLOCK = 256;
+const int _BIN_FFT = 512;
+const int _BIN_CH = 16;
+
+// --- FFT (radix 2, in place, 512 points) ---
+
+struct _Fft {
+    float[512] cos_t;
+    float[512] sin_t;
+    int[512] rev;
+}
+
+void _fft_init(*_Fft f) {
+    int n = _BIN_FFT;
+    for (i in 0..n) {
+        f.cos_t[i] = (float)cos(-2.0 * 3.14159265358979 * (double)i / (double)n);
+        f.sin_t[i] = (float)sin(-2.0 * 3.14159265358979 * (double)i / (double)n);
+        int r = 0;
+        int x = i;
+        for (b in 0..9) {
+            r = (r << 1) | (x & 1);
+            x >>= 1;
+        }
+        f.rev[i] = r;
+    }
+}
+
+// The transform of re/im in place; inverse divides by n.
+void _fft(*_Fft f, *float re, *float im, bool inverse) {
+    int n = _BIN_FFT;
+    for (i in 0..n) {
+        int j = f.rev[i];
+        if (j > i) {
+            float t = re[i];
+            re[i] = re[j];
+            re[j] = t;
+            t = im[i];
+            im[i] = im[j];
+            im[j] = t;
+        }
+    }
+    int size = 2;
+    while (size <= n) {
+        int half = size / 2;
+        int step = n / size;
+        int start = 0;
+        while (start < n) {
+            for (k in 0..half) {
+                float wr = f.cos_t[k * step];
+                float wi = inverse ? -f.sin_t[k * step] : f.sin_t[k * step];
+                int a = start + k;
+                int b = a + half;
+                float xr = re[b] * wr - im[b] * wi;
+                float xi = re[b] * wi + im[b] * wr;
+                re[b] = re[a] - xr;
+                im[b] = im[a] - xi;
+                re[a] = re[a] + xr;
+                im[a] = im[a] + xi;
+            }
+            start += size;
+        }
+        size *= 2;
+    }
+    if (inverse) {
+        for (i in 0..n) {
+            re[i] /= (float)n;
+            im[i] /= (float)n;
+        }
+    }
+}
+
+// --- spherical harmonics ---
+
+// The third-order SN3D coefficients (ACN order) of a direction given in AmbiX axes (x ahead,
+// y left, z up), unit length.
+void audio_sh_coeffs(float x, float y, float z, *float c) {
+    c[0] = 1.0;
+    c[1] = y;
+    c[2] = z;
+    c[3] = x;
+    c[4] = 1.7320508 * x * y;
+    c[5] = 1.7320508 * y * z;
+    c[6] = 0.5 * (3.0 * z * z - 1.0);
+    c[7] = 1.7320508 * x * z;
+    c[8] = 0.8660254 * (x * x - y * y);
+    c[9] = 0.7905694 * y * (3.0 * x * x - y * y);
+    c[10] = 3.8729833 * x * y * z;
+    c[11] = 0.6123724 * y * (5.0 * z * z - 1.0);
+    c[12] = 0.5 * z * (5.0 * z * z - 3.0);
+    c[13] = 0.6123724 * x * (5.0 * z * z - 1.0);
+    c[14] = 1.9364917 * z * (x * x - y * y);
+    c[15] = 0.7905694 * x * (x * x - 3.0 * y * y);
+}
+
+// Whether ACN channel c has a negative degree (its HRIR flips sign for the right ear).
+bool _bin_negative(int c) {
+    int order = 0;
+    while ((order + 1) * (order + 1) <= c) order++;
+    return c - order * (order + 1) < 0;
+}
+
+// --- rooms ---
+
+// Surface materials, Resonance's (ViroReact's ViroSoundRoom materials).
+enum AudioMaterial { AudioTransparent, AudioAcousticCeilingTiles, AudioBrickBare, AudioBrickPainted, AudioConcreteBlockCoarse,
+                     AudioConcreteBlockPainted, AudioCurtainHeavy, AudioFiberGlassInsulation, AudioGlassThin, AudioGlassThick,
+                     AudioGrass, AudioLinoleumOnConcrete, AudioMarble, AudioMetal, AudioParquetOnConcrete, AudioPlasterRough,
+                     AudioPlasterSmooth, AudioPlywoodPanel, AudioPolishedConcreteOrTile, AudioSheetrock, AudioWaterOrIceSurface,
+                     AudioWoodCeiling, AudioWoodPanel, AudioUniform }
+
+// Absorption by material in nine octave bands, 31.25 Hz to 8 kHz (Resonance's table).
+float[216] _audio_absorption = {
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    0.672, 0.675, 0.700, 0.660, 0.720, 0.920, 0.880, 0.750, 1.000,
+    0.030, 0.030, 0.030, 0.030, 0.030, 0.040, 0.050, 0.070, 0.140,
+    0.006, 0.007, 0.010, 0.010, 0.020, 0.020, 0.020, 0.030, 0.060,
+    0.360, 0.360, 0.360, 0.440, 0.310, 0.290, 0.390, 0.250, 0.500,
+    0.092, 0.090, 0.100, 0.050, 0.060, 0.070, 0.090, 0.080, 0.160,
+    0.073, 0.106, 0.140, 0.350, 0.550, 0.720, 0.700, 0.650, 1.000,
+    0.193, 0.220, 0.220, 0.820, 0.990, 0.990, 0.990, 0.990, 1.000,
+    0.180, 0.169, 0.180, 0.060, 0.040, 0.030, 0.020, 0.020, 0.040,
+    0.350, 0.350, 0.350, 0.250, 0.180, 0.120, 0.070, 0.040, 0.080,
+    0.05, 0.05, 0.15, 0.25, 0.40, 0.55, 0.60, 0.60, 0.60,
+    0.020, 0.020, 0.020, 0.030, 0.030, 0.030, 0.030, 0.020, 0.040,
+    0.010, 0.010, 0.010, 0.010, 0.010, 0.010, 0.020, 0.020, 0.040,
+    0.030, 0.035, 0.04, 0.04, 0.05, 0.05, 0.05, 0.07, 0.09,
+    0.028, 0.030, 0.040, 0.040, 0.070, 0.060, 0.060, 0.070, 0.140,
+    0.017, 0.018, 0.020, 0.030, 0.040, 0.050, 0.040, 0.030, 0.060,
+    0.011, 0.012, 0.013, 0.015, 0.020, 0.030, 0.040, 0.050, 0.100,
+    0.40, 0.34, 0.28, 0.22, 0.17, 0.09, 0.10, 0.11, 0.22,
+    0.008, 0.008, 0.010, 0.010, 0.015, 0.020, 0.020, 0.020, 0.040,
+    0.290, 0.279, 0.290, 0.100, 0.050, 0.040, 0.070, 0.090, 0.180,
+    0.006, 0.006, 0.008, 0.008, 0.013, 0.015, 0.020, 0.025, 0.050,
+    0.150, 0.147, 0.150, 0.110, 0.100, 0.070, 0.060, 0.070, 0.140,
+    0.280, 0.280, 0.280, 0.220, 0.170, 0.090, 0.100, 0.110, 0.220,
+    0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5};
+
+float[9] _audio_air = {0.0006, 0.0006, 0.0007, 0.0008, 0.0010, 0.0015, 0.0026, 0.0060, 0.0207};
+
+// A shoebox room (ViroReact's ViroSoundRoom): its middle and size in meters (width x, height
+// y, depth z, axis-aligned), the material of each surface (left, right, floor, ceiling, front,
+// back), and scales for the reflections, the reverb's level, its time and its brightness
+// (Resonance's room properties; 1, 1, 1 and 0 leave them as the materials give them).
+struct AudioRoom {
+    float[3] position;
+    float[3] size;
+    int[6] materials;
+    float reflection_scalar = 1.0;
+    float reverb_gain = 1.0;
+    float reverb_time = 1.0;
+    float reverb_brightness = 0.0;
+}
+
+// A room of size w x h x d with walls, floor and ceiling of the materials given.
+AudioRoom audio_room(float w, float h, float d, int walls, int floor, int ceiling) {
+    AudioRoom r;
+    r.size[0] = w;
+    r.size[1] = h;
+    r.size[2] = d;
+    r.materials[0] = walls;
+    r.materials[1] = walls;
+    r.materials[2] = floor;
+    r.materials[3] = ceiling;
+    r.materials[4] = walls;
+    r.materials[5] = walls;
+    r.reflection_scalar = 1.0;
+    r.reverb_gain = 1.0;
+    r.reverb_time = 1.0;
+    return r;
+}
+
+// The room's RT60 in its nine octave bands, seconds (Eyring, with air absorption; scaled by
+// reverb_time and tilted by reverb_brightness as Resonance does).
+void AudioRoom_rt60(*AudioRoom self, *float out) {
+    float w = self.size[0];
+    float h = self.size[1];
+    float d = self.size[2];
+    float volume = w * h * d;
+    for (b in 0..9) out[b] = 0.0;
+    if (volume < 1e-6) return;
+    float[6] area = {h * d, h * d, w * d, w * d, w * h, w * h};
+    float total = 0.0;
+    for (s in 0..6) total += area[s];
+    for (b in 0..9) {
+        float absorbing = 0.0;
+        for (s in 0..6) {
+            int m = self.materials[s] < 0 || self.materials[s] > 23 ? 0 : self.materials[s];
+            absorbing += _audio_absorption[m * 9 + b] * area[s];
+        }
+        float mean = absorbing / total;
+        if (mean > 0.9999) mean = 0.9999;
+        float rt = 0.161 * volume / (-total * (float)log((double)(1.0 - mean)) + 4.0 * _audio_air[b] * volume);
+        out[b] = rt * (1.0 + self.reverb_brightness * (float)(b + 1) / 9.0) * self.reverb_time;
+    }
+}
+
+// Each surface's reflection coefficient: from its mean absorption at 500 Hz, 1 kHz and 2 kHz.
+float _room_reflection(*AudioRoom self, int s) {
+    int m = self.materials[s] < 0 || self.materials[s] > 23 ? 0 : self.materials[s];
+    float a = (_audio_absorption[m * 9 + 4] + _audio_absorption[m * 9 + 5] + _audio_absorption[m * 9 + 6]) / 3.0;
+    float r = (float)sqrt((double)(1.0 - a));
+    return r > 1.0 ? 1.0 : r;
+}
+
+// How much of a source at p reaches the room's effects: 1 inside, then 1 / (1 + d)^2 with d
+// its distance to the room (Resonance's room effects gain).
+float AudioRoom_gain(*AudioRoom self, float px, float py, float pz) {
+    float[3] p = {px - self.position[0], py - self.position[1], pz - self.position[2]};
+    float dd = 0.0;
+    for (k in 0..3) {
+        float half = self.size[k] * 0.5;
+        float out = p[k] < -half ? -half - p[k] : (p[k] > half ? p[k] - half : 0.0);
+        dd += out * out;
+    }
+    float dist = 1.0 + (float)sqrt((double)dd);
+    if (self.size[0] * self.size[1] * self.size[2] < 1e-6) return 0.0;
+    return 1.0 / (dist * dist);
+}
+
+// --- the renderer ---
+
+const int _BIN_FDN = 8;
+const int _BIN_REFLECTION_LINE = 16384;
+
+// The spatial renderer a mixer keeps (Mixer.spatial, made by Mixer_set_binaural or
+// Mixer_set_room): the HRIR spectra, the block's ambisonic and room inputs, the convolution's
+// tails, the room's reflections and reverb.
+struct AudioSpatial {
+    bool binaural;
+    _Fft fft;
+    int taps;
+    // each channel's HRIR spectrum (left ear)
+    float[8192] h_re;
+    float[8192] h_im;
+    // the block's ambisonic input and the room's mono input
+    float[4096] amb;
+    float[256] room_in;
+    // the convolution's tail, by ear
+    float[512] tail_l;
+    float[512] tail_r;
+    bool has_room;
+    AudioRoom room;
+    float[6] refl_gain;
+    int[6] refl_delay;
+    float[24] refl_sh;
+    float* line;
+    int line_at;
+    // the reverb: 8 delay lines, their lengths, positions, feedback gains and damping
+    float* fdn;
+    int[8] fdn_len;
+    int[8] fdn_at;
+    float[8] fdn_gain;
+    float[8] fdn_damp;
+    float[8] fdn_state;
+    float reverb_level;
+    int rate;
+}
+
+// A renderer for output at rate Hz: the HRIRs resampled to it and moved to the frequency
+// domain.
+*AudioSpatial audio_spatial_new(int rate) {
+    *AudioSpatial s = alloc<AudioSpatial>(1);
+    s.rate = rate;
+    _fft_init(&s.fft);
+    int taps = (int)((int64)AUDIO_HRIR_LENGTH * rate / AUDIO_HRIR_RATE);
+    if (taps > _BIN_BLOCK) taps = _BIN_BLOCK;
+    s.taps = taps;
+    float[512] re;
+    float[512] im;
+    for (c in 0.._BIN_CH) {
+        for (i in 0.._BIN_FFT) {
+            re[i] = 0.0;
+            im[i] = 0.0;
+        }
+        for (i in 0..taps) {
+            // linear resampling from 48 kHz; the gain keeps the response's level
+            double t = (double)i * (double)AUDIO_HRIR_RATE / (double)rate;
+            int i0 = (int)t;
+            double f = t - (double)i0;
+            float a = i0 < AUDIO_HRIR_LENGTH ? (float)audio_hrir[c * AUDIO_HRIR_LENGTH + i0] : 0.0;
+            float b = i0 + 1 < AUDIO_HRIR_LENGTH ? (float)audio_hrir[c * AUDIO_HRIR_LENGTH + i0 + 1] : 0.0;
+            re[i] = (a + (b - a) * (float)f) / 32768.0 * (float)AUDIO_HRIR_RATE / (float)rate;
+        }
+        _fft(&s.fft, &re[0], &im[0], false);
+        for (i in 0.._BIN_FFT) {
+            s.h_re[c * _BIN_FFT + i] = re[i];
+            s.h_im[c * _BIN_FFT + i] = im[i];
+        }
+    }
+    s.line = alloc<float>(_BIN_REFLECTION_LINE);
+    return s;
+}
+
+// Frees a renderer.
+void audio_spatial_free(*AudioSpatial s) {
+    if (s == null) return;
+    free((*void)s.line);
+    free((*void)s.fdn);
+    free((*void)s);
+}
+
+// Sets the room (has false for none): reflection gains, delays and directions are kept for the
+// listener at (lx, ly, lz) by AudioSpatial_listener; the reverb's lines are tuned to the RT60.
+void AudioSpatial_room(*AudioSpatial s, bool has, *AudioRoom room) {
+    s.has_room = has;
+    if (!has) return;
+    s.room = *room;
+    float[9] rt;
+    AudioRoom_rt60(room, &rt[0]);
+    // the middle bands set the decay, the top band its damping
+    float mid = (rt[4] + rt[5] + rt[6]) / 3.0;
+    float high = rt[8];
+    int[8] primes = {1031, 1327, 1523, 1801, 2053, 2381, 2713, 3001};
+    int total = 0;
+    float scale = (float)s.rate / 48000.0;
+    for (k in 0.._BIN_FDN) {
+        s.fdn_len[k] = (int)((float)primes[k] * scale) + 1;
+        total += s.fdn_len[k];
+    }
+    free((*void)s.fdn);
+    s.fdn = alloc<float>(total);
+    for (k in 0.._BIN_FDN) {
+        s.fdn_at[k] = 0;
+        s.fdn_state[k] = 0.0;
+        float seconds = (float)s.fdn_len[k] / (float)s.rate;
+        s.fdn_gain[k] = mid > 0.01 ? (float)pow(10.0, (double)(-3.0 * seconds / mid)) : 0.0;
+        float gh = high > 0.01 ? (float)pow(10.0, (double)(-3.0 * seconds / high)) : 0.0;
+        // a one-pole low-pass whose loss at the top makes the high band decay in its own time
+        float ratio = s.fdn_gain[k] > 1e-6 ? gh / s.fdn_gain[k] : 1.0;
+        if (ratio > 1.0) ratio = 1.0;
+        s.fdn_damp[k] = 1.0 - ratio;
+    }
+    s.reverb_level = 0.045 * room.reverb_gain;
+}
+
+// The listener's place and axes (right, up, ahead as unit vectors) for the reflections: each
+// surface's reflection arrives from the surface's direction, after the round trip to it
+// (Resonance's shoebox reflections around the listener).
+void AudioSpatial_listener(*AudioSpatial s, float lx, float ly, float lz, *float right, *float up, *float ahead) {
+    if (!s.has_room) return;
+    float[3] p = {lx - s.room.position[0], ly - s.room.position[1], lz - s.room.position[2]};
+    for (w in 0..6) {
+        int axis = w / 2;
+        float half = s.room.size[axis] * 0.5;
+        float sign = w % 2 == 0 ? -1.0 : 1.0;
+        float dist = half - sign * p[axis];
+        if (dist < 0.1) dist = 0.1;
+        float path = 2.0 * dist;
+        int delay = (int)(path / 343.0 * (float)s.rate);
+        if (delay >= _BIN_REFLECTION_LINE) delay = _BIN_REFLECTION_LINE - 1;
+        s.refl_delay[w] = delay;
+        // the 1 / distance of the image, scaled by the surface and the room's scalar
+        s.refl_gain[w] = _room_reflection(&s.room, w) * s.room.reflection_scalar / (1.0 + path);
+        float[3] dir = {0.0, 0.0, 0.0};
+        dir[axis] = sign;
+        float ax = dir[0] * ahead[0] + dir[1] * ahead[1] + dir[2] * ahead[2];
+        float ay = -(dir[0] * right[0] + dir[1] * right[1] + dir[2] * right[2]);
+        float az = dir[0] * up[0] + dir[1] * up[1] + dir[2] * up[2];
+        // first order is enough for reflections, as Resonance encodes them
+        s.refl_sh[w * 4] = 1.0;
+        s.refl_sh[w * 4 + 1] = ay;
+        s.refl_sh[w * 4 + 2] = az;
+        s.refl_sh[w * 4 + 3] = ax;
+    }
+}
+
+// Clears the block's inputs.
+void AudioSpatial_begin(*AudioSpatial s) {
+    for (i in 0.._BIN_CH * _BIN_BLOCK) s.amb[i] = 0.0;
+    for (i in 0.._BIN_BLOCK) s.room_in[i] = 0.0;
+}
+
+// Adds a mono sample at frame i of the block from a direction (its SH coefficients).
+void AudioSpatial_add(*AudioSpatial s, int i, float sample, *float sh) {
+    for (c in 0.._BIN_CH) s.amb[c * _BIN_BLOCK + i] += sample * sh[c];
+}
+
+// Renders the block's `frames` frames into out (stereo, added): reflections into the
+// ambisonic input, the binaural decode (or, without binaural, a stereo decode of the first
+// order), and the reverb.
+void AudioSpatial_end(*AudioSpatial s, int frames, *float out) {
+    if (s.has_room) {
+        for (i in 0..frames) {
+            float x = s.room_in[i];
+            s.line[s.line_at] = x;
+            for (w in 0..6) {
+                int at = s.line_at - s.refl_delay[w];
+                if (at < 0) at += _BIN_REFLECTION_LINE;
+                float v = s.line[at] * s.refl_gain[w];
+                for (c in 0..4) s.amb[c * _BIN_BLOCK + i] += v * s.refl_sh[w * 4 + c];
+            }
+            s.line_at = (s.line_at + 1) % _BIN_REFLECTION_LINE;
+        }
+    }
+    if (s.binaural) {
+        float[512] acc_re_l;
+        float[512] acc_im_l;
+        float[512] acc_re_r;
+        float[512] acc_im_r;
+        for (i in 0.._BIN_FFT) {
+            acc_re_l[i] = 0.0;
+            acc_im_l[i] = 0.0;
+            acc_re_r[i] = 0.0;
+            acc_im_r[i] = 0.0;
+        }
+        float[512] re;
+        float[512] im;
+        for (c in 0.._BIN_CH) {
+            bool any = false;
+            for (i in 0..frames) {
+                if (s.amb[c * _BIN_BLOCK + i] != 0.0) any = true;
+            }
+            if (!any) continue;
+            for (i in 0.._BIN_FFT) {
+                re[i] = i < frames ? s.amb[c * _BIN_BLOCK + i] : 0.0;
+                im[i] = 0.0;
+            }
+            _fft(&s.fft, &re[0], &im[0], false);
+            float sign = _bin_negative(c) ? -1.0 : 1.0;
+            for (i in 0.._BIN_FFT) {
+                float hr = s.h_re[c * _BIN_FFT + i];
+                float hi = s.h_im[c * _BIN_FFT + i];
+                float yr = re[i] * hr - im[i] * hi;
+                float yi = re[i] * hi + im[i] * hr;
+                acc_re_l[i] += yr;
+                acc_im_l[i] += yi;
+                acc_re_r[i] += sign * yr;
+                acc_im_r[i] += sign * yi;
+            }
+        }
+        _fft(&s.fft, &acc_re_l[0], &acc_im_l[0], true);
+        _fft(&s.fft, &acc_re_r[0], &acc_im_r[0], true);
+        // overlap-add: the block's frames out, the rest kept for the next block
+        for (i in 0.._BIN_FFT) {
+            acc_re_l[i] += s.tail_l[i];
+            acc_re_r[i] += s.tail_r[i];
+        }
+        for (i in 0..frames) {
+            out[i * 2] += acc_re_l[i];
+            out[i * 2 + 1] += acc_re_r[i];
+        }
+        for (i in 0.._BIN_FFT) {
+            s.tail_l[i] = i + frames < _BIN_FFT ? acc_re_l[i + frames] : 0.0;
+            s.tail_r[i] = i + frames < _BIN_FFT ? acc_re_r[i + frames] : 0.0;
+        }
+    } else {
+        // stereo: the first order as two virtual cardioids toward the ears
+        for (i in 0..frames) {
+            float w = s.amb[i];
+            float y = s.amb[_BIN_BLOCK + i];
+            out[i * 2] += 0.5 * (w + y);
+            out[i * 2 + 1] += 0.5 * (w - y);
+        }
+    }
+    if (s.has_room && s.fdn != null) {
+        for (i in 0..frames) {
+            float x = s.room_in[i] * s.reverb_level;
+            float[8] y;
+            int base = 0;
+            float sum = 0.0;
+            for (k in 0.._BIN_FDN) {
+                float v = s.fdn[base + s.fdn_at[k]];
+                // damping, then the decay
+                s.fdn_state[k] = v * (1.0 - s.fdn_damp[k]) + s.fdn_state[k] * s.fdn_damp[k];
+                y[k] = s.fdn_state[k] * s.fdn_gain[k];
+                sum += y[k];
+                base += s.fdn_len[k];
+            }
+            // Householder mixing, then each line fed back with the input
+            float m = sum * 2.0 / (float)_BIN_FDN;
+            base = 0;
+            float l = 0.0;
+            float r = 0.0;
+            for (k in 0.._BIN_FDN) {
+                s.fdn[base + s.fdn_at[k]] = y[k] - m + x;
+                s.fdn_at[k] = (s.fdn_at[k] + 1) % s.fdn_len[k];
+                base += s.fdn_len[k];
+                if (k % 2 == 0) l += y[k];
+                else r += y[k];
+            }
+            out[i * 2] += l * 0.5;
+            out[i * 2 + 1] += r * 0.5;
+        }
+    }
+}

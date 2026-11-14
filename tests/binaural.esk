@@ -1,0 +1,188 @@
+// Binaural rendering and rooms: noise from the left is louder in the left ear and the other
+// way round, from ahead it is even, from behind it sounds different from ahead; a click
+// arrives within the HRIR's length; a sound field's left channel lands left; rendering in
+// any block sizes gives the same samples; a room's RT60s follow Eyring with its materials, a
+// reflective room rings longer than a soft one, and a wall's reflection comes back after its
+// round trip.
+import <io>;
+import <mem>;
+import <libc>;
+import <math>;
+import <audio/wav>;
+import <audio/mixer>;
+import <audio/binaural>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+const int RATE = 48000;
+
+Sound noise(int frames) {
+    Sound s = sound_new((uint64)frames, 1, RATE);
+    uint32 x = 12345;
+    for (i in 0..frames) {
+        x = x * (uint32)1103515245 + (uint32)12345;
+        s.data[i] = ((float)((x >> 16) & 32767) / 16384.0 - 1.0) * 0.3;
+    }
+    return s;
+}
+
+// The energy of each ear over frames rendered from a positioned noise.
+void ears(AudioVec3 at, *Sound s, *double l, *double r, *double diff_hi) {
+    Mixer m = mixer_new(RATE);
+    m.set_binaural(true);
+    m.play_at(s, AudioPlay{volume: 1.0}, at);
+    *float out = alloc<float>(8192 * 2);
+    m.render(out, 8192);
+    *l = 0.0;
+    *r = 0.0;
+    *diff_hi = 0.0;
+    for (i in 1024..8192) {
+        *l += (double)(out[i * 2] * out[i * 2]);
+        *r += (double)(out[i * 2 + 1] * out[i * 2 + 1]);
+        // a crude high band: the first difference
+        float d = out[i * 2] - out[i * 2 - 2];
+        *diff_hi += (double)(d * d);
+    }
+    free((*void)out);
+    m.free();
+}
+
+int main() {
+    Sound n = noise(16384);
+    double l = 0.0;
+    double r = 0.0;
+    double hi_front = 0.0;
+    double hi_back = 0.0;
+    ears(AudioVec3{-2.0, 0.0, 0.0}, &n, &l, &r, &hi_front);
+    printf("left: L %.2f R %.2f\n", l, r);
+    check("from the left, louder left", l > r * 3.0);
+    ears(AudioVec3{2.0, 0.0, 0.0}, &n, &l, &r, &hi_front);
+    check("from the right, louder right", r > l * 3.0);
+    ears(AudioVec3{0.0, 0.0, -2.0}, &n, &l, &r, &hi_front);
+    check("ahead, even", l / r > 0.8 && l / r < 1.25);
+    double front = l;
+    ears(AudioVec3{0.0, 0.0, 2.0}, &n, &l, &r, &hi_back);
+    printf("front hi %.3f back hi %.3f\n", hi_front, hi_back);
+    check("behind, even, and not as ahead", l / r > 0.8 && l / r < 1.25 && fabs(hi_front - hi_back) / hi_front > 0.05);
+
+    // a click: it arrives within the HRIR's length
+    Sound click = sound_new(4096, 1, RATE);
+    click.data[0] = 1.0;
+    Mixer m = mixer_new(RATE);
+    m.set_binaural(true);
+    m.play_at(&click, AudioPlay{volume: 1.0}, AudioVec3{-1.0, 0.0, 0.0});
+    *float out = alloc<float>(4096 * 2);
+    m.render(out, 4096);
+    int first = -1;
+    int last = -1;
+    for (i in 0..4096) {
+        if (fabsf(out[i * 2]) > 1e-4) {
+            if (first < 0) first = i;
+            last = i;
+        }
+    }
+    check("a click within the HRIR", first >= 0 && first < 64 && last < 300);
+    m.free();
+
+    // any block sizes give the same samples
+    Mixer a = mixer_new(RATE);
+    Mixer b = mixer_new(RATE);
+    a.set_binaural(true);
+    b.set_binaural(true);
+    a.play_at(&n, AudioPlay{volume: 1.0}, AudioVec3{-1.0, 0.5, -1.0});
+    b.play_at(&n, AudioPlay{volume: 1.0}, AudioVec3{-1.0, 0.5, -1.0});
+    *float oa = alloc<float>(3000 * 2);
+    *float ob = alloc<float>(3000 * 2);
+    a.render(oa, 3000);
+    int at = 0;
+    int[5] sizes = {1, 100, 700, 37, 2162};
+    for (k in 0..5) {
+        b.render(ob + (int64)at * 2, sizes[k]);
+        at += sizes[k];
+    }
+    float worst = 0.0;
+    for (i in 0..6000) worst = fmax(worst, fabsf(oa[i] - ob[i]));
+    check("any block sizes, the same samples", worst < 1e-5);
+    a.free();
+    b.free();
+
+    // a sound field: its left (Y) channel lands left
+    Sound field = sound_new(8192, 4, RATE);
+    for (i in 0..8192) {
+        field.data[i * 4] = n.data[i];
+        field.data[i * 4 + 1] = n.data[i];
+    }
+    Mixer fm = mixer_new(RATE);
+    fm.set_binaural(true);
+    fm.play_field(&field, AudioPlay{volume: 1.0}, AudioQuat{0.0, 0.0, 0.0, 1.0});
+    fm.render(out, 4096);
+    double fl = 0.0;
+    double fr = 0.0;
+    for (i in 512..4096) {
+        fl += (double)(out[i * 2] * out[i * 2]);
+        fr += (double)(out[i * 2 + 1] * out[i * 2 + 1]);
+    }
+    check("a field's left lands left", fl > fr * 2.0);
+    fm.free();
+
+    // rooms: Eyring
+    AudioRoom brick = audio_room(10.0, 3.0, 8.0, AudioBrickBare, AudioParquetOnConcrete, AudioPlasterSmooth);
+    float[9] rt;
+    brick.rt60(&rt[0]);
+    // the 1 kHz band by hand: walls 0.04, floor 0.06, ceiling 0.03
+    float area = 2.0 * (3.0 * 8.0) + 2.0 * (10.0 * 3.0) + 10.0 * 8.0 * 2.0;
+    float absorbing = 0.04 * (2.0 * 24.0 + 2.0 * 30.0) + 0.06 * 80.0 + 0.03 * 80.0;
+    float want = 0.161 * 240.0 / (-area * (float)log((double)(1.0 - absorbing / area)) + 4.0 * 0.0015 * 240.0);
+    printf("rt60 1k %.3f want %.3f\n", (double)rt[5], (double)want);
+    check("RT60 by Eyring", fabsf(rt[5] - want) < 0.01);
+    AudioRoom soft = audio_room(10.0, 3.0, 8.0, AudioCurtainHeavy, AudioCurtainHeavy, AudioAcousticCeilingTiles);
+    float[9] rs;
+    soft.rt60(&rs[0]);
+    check("a soft room is shorter", rs[5] < rt[5] * 0.3);
+
+    // a reflective room rings longer than a soft one
+    double[2] tail;
+    for (k in 0..2) {
+        Mixer rm = mixer_new(RATE);
+        rm.set_room(true, k == 0 ? brick : soft);
+        rm.play_at(&click, AudioPlay{volume: 1.0}, AudioVec3{0.0, 0.0, -1.0});
+        *float big = alloc<float>(48000 * 2);
+        rm.render(big, 48000);
+        tail[k] = 0.0;
+        for (i in 24000..48000) tail[k] += (double)(big[i * 2] * big[i * 2]);
+        free((*void)big);
+        rm.free();
+    }
+    printf("tail brick %.6f soft %.6f\n", tail[0], tail[1]);
+    check("a reflective room rings longer", tail[0] > tail[1] * 10.0);
+
+    // a wall 1.5 m to the left of the listener (in a 3 m wide room): its echo after 3 m
+    AudioRoom narrow = audio_room(3.0, 40.0, 40.0, AudioMarble, AudioTransparent, AudioTransparent);
+    narrow.reverb_gain = 0.0;
+    Mixer em = mixer_new(RATE);
+    em.set_binaural(true);
+    em.set_room(true, narrow);
+    em.play_at(&click, AudioPlay{volume: 1.0}, AudioVec3{0.0, 0.0, -1.0});
+    *float echo = alloc<float>(4096 * 2);
+    em.render(echo, 4096);
+    int expect = (int)(3.0 / 343.0 * 48000.0);
+    float peak = 0.0;
+    for (i in expect..expect + 200) peak = fmax(peak, fabsf(echo[i * 2]));
+    float before = 0.0;
+    for (i in 300..expect - 50) before = fmax(before, fabsf(echo[i * 2]));
+    printf("echo at %d: %.4f, before it %.4f\n", expect, (double)peak, (double)before);
+    check("a wall's echo after its round trip", peak > 0.01 && peak > before * 4.0);
+    em.free();
+    free((*void)out);
+    free((*void)echo);
+    if (fails > 0) return 1;
+    printf("binaural: ok\n");
+    return 0;
+}

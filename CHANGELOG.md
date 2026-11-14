@@ -8,6 +8,11 @@ All notable changes to this package are documented here. The format follows
 
 ### Added
 
+- Binaural rendering and rooms (ViroReact's, through Resonance Audio): `Mixer_set_binaural`
+  encodes positioned sounds and sound fields into third-order ambisonics and convolves them
+  with the SADIE spherical-harmonic HRIRs (`<audio/hrir>`, from Resonance Audio, Apache
+  2.0); `Mixer_set_room` adds a shoebox room's early reflections and a reverb timed by the
+  RT60s its size and materials give (Eyring, Resonance's material table, `AudioRoom`).
 - Sound in space (ViroReact's `ViroSpatialSound` and `ViroSoundField`): `Mixer_play_at`
   places a voice at a point, panned by where it is around the listener and faded by
   `AUDIO_ROLLOFF_NONE`, `_LINEAR` or `_LOGARITHMIC` between a minimum and a maximum distance
