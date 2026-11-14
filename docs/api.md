@@ -365,13 +365,14 @@ From Resonance Audio's SH-HRIRs of the SADIE HRTF database (subject 002, a KU100
 head), Copyright 2018 Google Inc., Apache License 2.0: third_party/SADIE_hrtf_database in
 github.com/resonance-audio/resonance-audio. Symmetric: the right ear is the left one with
 the sign of the negative-degree channels flipped.
-Sixteen channels (third order).
 
 ### AUDIO_HRIR_CHANNELS
 
 ```eskiu
 const int AUDIO_HRIR_CHANNELS = 16;
 ```
+
+Sixteen channels (third order).
 
 ### AUDIO_HRIR_LENGTH
 

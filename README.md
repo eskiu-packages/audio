@@ -104,3 +104,9 @@ eskiuc build -L/opt/homebrew/lib       # the directory that holds libSDL3
 MIT. See [LICENSE](LICENSE). The Ogg Vorbis decoder (`src/ogg.esk`) is a port of
 [stb_vorbis](https://github.com/nothings/stb) by Sean Barrett and the stb_vorbis
 contributors, which is in the public domain or under the MIT license, at your choice.
+
+The binaural renderer's head-related impulse responses (`src/hrir.esk`) are Resonance
+Audio's spherical-harmonic encoding of the [SADIE](https://www.york.ac.uk/sadie-project/)
+HRTF database (subject 002), Copyright 2018 Google Inc., under the Apache License 2.0
+([resonance-audio](https://github.com/resonance-audio/resonance-audio)); the room material
+table in `src/binaural.esk` is Resonance's too.
