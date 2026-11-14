@@ -1,0 +1,452 @@
+// ogg_stream.esk: opening, reading, seeking and streams for the mixer (part of ogg.esk, which imports it in order after the ones before it)
+
+// ---------------------------------------------------------------------------------------
+// Opening, reading and seeking.
+
+// A comment's loop point: LOOPSTART, LOOPLENGTH or LOOPEND (any case) = frames.
+void _ogg_tag(*uint8 s, int64 n, *int64 start, *int64 length, *int64 end) {
+    int64 eq = 0;
+    while (eq < n && s[eq] != '=') eq++;
+    if (eq >= n) return;
+    String key;
+    defer String_free(&key);
+    for (i in 0..eq) {
+        char ch = (char)s[i];
+        if (ch >= 'a' && ch <= 'z') ch = (char)((int)ch - 32);
+        String_push(&key, ch);
+    }
+    int64 v = 0;
+    bool digits = false;
+    for (i in eq + 1..n) {
+        if (s[i] < '0' || s[i] > '9') break;
+        v = v * 10 + (int64)(s[i] - '0');
+        digits = true;
+        if (v > (int64)1 << 40) return;
+    }
+    if (!digits) return;
+    if (String_eq_cstr(&key, "LOOPSTART") != 0) *start = v;
+    else if (String_eq_cstr(&key, "LOOPLENGTH") != 0) *length = v;
+    else if (String_eq_cstr(&key, "LOOPEND") != 0) *end = v;
+}
+
+string _ogg_comments(*OggVorbis f, *uint8 p, int64 len) {
+    if (len < 7 || p[0] != 3 || memcmp(p + 1, "vorbis", 6) != 0) return "no comment header";
+    int64 start = -1;
+    int64 length = -1;
+    int64 end = -1;
+    int64 at = 7;
+    if (at + 4 > len) return null;
+    at += 4 + (int64)_ogg_u32(p + at);
+    if (at + 4 > len) return null;
+    int64 count = (int64)_ogg_u32(p + at);
+    at += 4;
+    for (i in 0..count) {
+        if (at + 4 > len) break;
+        int64 n = (int64)_ogg_u32(p + at);
+        at += 4;
+        if (n > len - at) break;
+        _ogg_tag(p + at, n, &start, &length, &end);
+        at += n;
+    }
+    if (start >= 0 && length > 0) end = start + length;
+    if (start < 0 && end > 0) start = 0;
+    if (start >= 0 && end > start && (uint64)end <= f.frames) {
+        f.loop_start = (uint64)start;
+        f.loop_end = (uint64)end;
+    }
+    return null;
+}
+
+Result<OggVorbis, string> _ogg_err_free(*OggVorbis f, string what) {
+    OggVorbis_free(f);
+    return Err<OggVorbis, string>(_ogg_fail(what));
+}
+
+// Reads the Ogg Vorbis file at path and opens it for decoding.
+Result<OggVorbis, string> ogg_open(string path) {
+    int64 n = 0;
+    *uint8 d = fs_read_all(path, &n);
+    if (d == null) return Err<OggVorbis, string>(_ogg_fail("cannot read the file"));
+    return _ogg_open_owned(d, (uint64)n);
+}
+
+// Opens an Ogg Vorbis file held in memory (len bytes at d); the bytes are copied, so d can
+// be freed after.
+Result<OggVorbis, string> ogg_open_memory(*uint8 d, uint64 len) {
+    *uint8 copy = alloc<uint8>((int64)len + 1);
+    memcpy(copy, d, (int64)len);
+    return _ogg_open_owned(copy, len);
+}
+
+Result<OggVorbis, string> _ogg_open_owned(*uint8 d, uint64 len) {
+    OggVorbis f;
+    f._data = d;
+    f._len = len;
+    _ogg_pages(&f);
+    if (f._packets.size < 3) return _ogg_err_free(&f, "not an Ogg Vorbis file");
+    _ogg_assemble(&f, &f._packets.data[0]);
+    *uint8 id = f._pkt;
+    if (f._pktlen < 30 || id[0] != 1 || memcmp(id + 1, "vorbis", 6) != 0) return _ogg_err_free(&f, "not an Ogg Vorbis file");
+    if (_ogg_u32(id + 7) != 0) return _ogg_err_free(&f, "unsupported Vorbis version");
+    f.channels = (int)id[11];
+    f.rate = (int)_ogg_u32(id + 12);
+    int log0 = (int)(id[28] & 15);
+    int log1 = (int)(id[28] >> 4);
+    if (f.channels == 0 || f.rate <= 0 || log0 < 6 || log0 > 13 || log1 < 6 || log1 > 13 || log0 > log1) {
+        return _ogg_err_free(&f, "bad identification header");
+    }
+    f._bs0 = 1 << log0;
+    f._bs1 = 1 << log1;
+    _ogg_assemble(&f, &f._packets.data[2]);
+    string err = _ogg_setup(&f, f._pkt, f._pktlen);
+    if (err != null) return _ogg_err_free(&f, err);
+    _ogg_block_init(&f._blk[0], f._bs0);
+    _ogg_block_init(&f._blk[1], f._bs1);
+    int nch = f.channels;
+    int64 half = (int64)(f._bs1 / 2);
+    f._buf = alloc<float>((int64)nch * (int64)f._bs1);
+    f._prevw = alloc<float>((int64)nch * half);
+    f._tmp = alloc<float>(half);
+    f._rtmp = alloc<float>((int64)nch * half);
+    f._finaly = alloc<int>((int64)nch * 256);
+    int64 cap = 1;
+    for (i in 0..f._nres) {
+        _OggResidue* r = &f._res[i];
+        int64 size = r.type == 2 ? half * (int64)nch : half;
+        int64 begin = r.begin < size ? r.begin : size;
+        int64 end = r.end < size ? r.end : size;
+        int64 c = ((end - begin) / (int64)r.psize + (int64)f._books[r.classbook].dim) * (r.type == 2 ? 1 : (int64)nch);
+        if (c > cap) cap = c;
+    }
+    f._cls = alloc<int>(cap);
+    // The audio packets, each with the stream position its last frame ends at.
+    List<_OggPacket> audio;
+    int mbits = _ogg_ilog((int64)(f._nmodes - 1));
+    for (k in 3..f._packets.size) {
+        _OggPacket pk = f._packets.data[k];
+        if (pk.size == 0) continue;
+        int first = (int)f._data[f._pieces.data[pk.piece].at];
+        if ((first & 1) != 0) continue;
+        int mode = (first >> 1) & ((1 << mbits) - 1);
+        if (mode >= f._nmodes) continue;
+        pk.block = f._modes[mode].blockflag;
+        int64 bs = (int64)(pk.block != 0 ? f._bs1 : f._bs0);
+        if (audio.size == 0) pk.end = 0;
+        else {
+            _OggPacket* last = &audio.data[audio.size - 1];
+            pk.end = last.end + (int64)(last.block != 0 ? f._bs1 : f._bs0) / 4 + bs / 4;
+        }
+        List_push(&audio, pk);
+    }
+    for (k in 0..audio.size) {
+        _OggPacket* pk = &audio.data[k];
+        int n = pk.block != 0 ? f._bs1 : f._bs0;
+        bool next_long = k + 1 < audio.size ? audio.data[k + 1].block != 0 : true;
+        int right = pk.block != 0 && !next_long ? (n * 3 - f._bs0) >> 2 : n / 2;
+        pk.stop = pk.end + (int64)(right - n / 2);
+    }
+    _OggPacket[3] headers = {f._packets.data[0], f._packets.data[1], f._packets.data[2]};
+    List_free(&f._packets);
+    f._packets = audio;
+    // Granule positions: the first page that has one says where the stream starts (a
+    // first page that ends before its packets do drops frames from the start), and the
+    // last page cuts the end. A stream with a single such page only cuts its end.
+    int first = -1;
+    int last = -1;
+    for (k in 0..f._packets.size) {
+        if (f._packets.data[k].granule < 0) continue;
+        if (first < 0) first = k;
+        last = k;
+    }
+    int64 shift = 0;
+    int64 endd = f._packets.size > 0 ? f._packets.data[f._packets.size - 1].end : 0;
+    if (first >= 0 && first != last) shift = f._packets.data[first].granule - f._packets.data[first].end;
+    if (last >= 0 && last == f._packets.size - 1) {
+        int64 e = f._packets.data[last].granule - shift;
+        if (e < endd) endd = e;
+    }
+    f._pre = shift < 0 ? 0 - shift : 0;
+    if (endd < f._pre) endd = f._pre;
+    f._endd = endd;
+    f.frames = (uint64)(endd - f._pre);
+    _ogg_assemble(&f, &headers[1]);
+    err = _ogg_comments(&f, f._pkt, f._pktlen);
+    if (err != null) return _ogg_err_free(&f, err);
+    OggVorbis_seek(&f, 0);
+    return Ok<OggVorbis, string>(f);
+}
+
+// Decodes up to frames frames, interleaved (channels floats each, between -1 and 1), into
+// out from where the decoder is; returns how many it wrote, 0 at the end.
+int64 OggVorbis_read(*OggVorbis self, *float out, int64 frames) {
+    int64 done = 0;
+    int nch = self.channels;
+    while (done < frames && self._cur < self._endd) {
+        if (self._cur >= self._outpos + (int64)self._outcnt) {
+            if (self._next >= self._packets.size) break;
+            _ogg_step(self);
+            continue;
+        }
+        int64 n = frames - done;
+        if (n > self._endd - self._cur) n = self._endd - self._cur;
+        if (self._cur < self._outpos) {
+            if (n > self._outpos - self._cur) n = self._outpos - self._cur;
+            memset(out + done * (int64)nch, 0, n * (int64)nch * 4);
+        } else {
+            int64 at = self._cur - self._outpos;
+            if (n > (int64)self._outcnt - at) n = (int64)self._outcnt - at;
+            int64 from = (int64)self._outfrom + at;
+            for (ch in 0..nch) {
+                *float v = self._buf + (int64)ch * (int64)self._bs1 + from;
+                *float o = out + done * (int64)nch + (int64)ch;
+                for (i in 0..n) o[i * (int64)nch] = v[i];
+            }
+        }
+        done += n;
+        self._cur += n;
+    }
+    return done;
+}
+
+// Moves the decoder to frame (0 is the first); the next read starts with exactly that
+// frame. A frame at or past the end leaves nothing to read.
+void OggVorbis_seek(*OggVorbis self, uint64 frame) {
+    self._outcnt = 0;
+    self._outpos = 0;
+    self._prevlen = 0;
+    if (frame >= self.frames || self._packets.size == 0) {
+        self._cur = self._endd;
+        self._next = self._packets.size;
+        return;
+    }
+    int64 d = self._pre + (int64)frame;
+    // The first packet whose frames reach past d; the one before it primes the overlap.
+    int lo = 0;
+    int hi = self._packets.size - 1;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (self._packets.data[mid].stop > d) hi = mid;
+        else lo = mid + 1;
+    }
+    self._next = lo > 0 ? lo - 1 : 0;
+    self._cur = d;
+}
+
+// The frame the next read starts at.
+uint64 OggVorbis_tell(*OggVorbis self) {
+    return (uint64)(self._cur - self._pre);
+}
+
+// Frees the decoder and the file's bytes.
+void OggVorbis_free(*OggVorbis self) {
+    if (self._books != null) {
+        for (i in 0..self._nbooks) {
+            _OggBook* c = &self._books[i];
+            if (c.lens != null) free(c.lens);
+            if (c.codes != null) free(c.codes);
+            if (c.fast != null) free(c.fast);
+            if (c.sorted != null) free(c.sorted);
+            if (c.sorted_sym != null) free(c.sorted_sym);
+            if (c.vq != null) free(c.vq);
+        }
+        free(self._books);
+    }
+    if (self._floors != null) free(self._floors);
+    if (self._res != null) free(self._res);
+    if (self._maps != null) free(self._maps);
+    for (i in 0..2) {
+        _OggBlock* k = &self._blk[i];
+        if (k.a != null) free(k.a);
+        if (k.b != null) free(k.b);
+        if (k.c != null) free(k.c);
+        if (k.win != null) free(k.win);
+        if (k.rev != null) free(k.rev);
+    }
+    if (self._buf != null) free(self._buf);
+    if (self._prevw != null) free(self._prevw);
+    if (self._tmp != null) free(self._tmp);
+    if (self._rtmp != null) free(self._rtmp);
+    if (self._cls != null) free(self._cls);
+    if (self._finaly != null) free(self._finaly);
+    if (self._pkt != null) free(self._pkt);
+    if (self._data != null) free(self._data);
+    List_free(&self._pieces);
+    List_free(&self._packets);
+    *self = OggVorbis{};
+}
+
+// Reads and decodes the whole Ogg Vorbis file at path; its loop points, when it has them,
+// go to the Sound's.
+Result<Sound, string> ogg_load(string path) {
+    OggVorbis f = ogg_open(path)?;
+    return _ogg_sound(&f);
+}
+
+// Decodes a whole Ogg Vorbis file held in memory (len bytes at d); the samples are copied,
+// so d can be freed after.
+Result<Sound, string> ogg_decode(*uint8 d, uint64 len) {
+    OggVorbis f = ogg_open_memory(d, len)?;
+    return _ogg_sound(&f);
+}
+
+Result<Sound, string> _ogg_sound(*OggVorbis f) {
+    Sound s = sound_new(f.frames, f.channels, f.rate);
+    s.frames = (uint64)OggVorbis_read(f, s.data, (int64)f.frames);
+    s.loop_start = f.loop_start;
+    s.loop_end = f.loop_end;
+    OggVorbis_free(f);
+    return Ok<Sound, string>(s);
+}
+
+// ---------------------------------------------------------------------------------------
+// Streams for the mixer.
+
+const int64 _OGG_BLOCK = 1024;
+
+// An Ogg Vorbis file as an AudioSource: decoded a block at a time as the mixer asks,
+// resampled to the mixer's rate (linear interpolation, as a voice plays a Sound) and, when
+// it loops, played from its loop start again each time it reaches its loop end (the whole
+// file for a file without loop points). A mono file plays on both sides; a file with more
+// than two channels plays its first two. Make one with ogg_stream or ogg_stream_from.
+struct OggStream {
+    OggVorbis ogg;
+    int rate;
+    bool loop;
+    double _step;
+    double _t;
+    float _al;
+    float _ar;
+    float _bl;
+    float _br;
+    bool _a;
+    bool _b;
+    uint64 _apos;
+    uint64 _bpos;
+    *float _blk;
+    int64 _blkn;
+    int64 _blkpos;
+    uint64 _blkat;
+    bool _done;
+}
+
+// Opens the Ogg Vorbis file at path as a stream at rate frames per second (the mixer's),
+// looping or not.
+Result<OggStream, string> ogg_stream(string path, int rate, bool loop) {
+    OggVorbis f = ogg_open(path)?;
+    return Ok<OggStream, string>(ogg_stream_from(f, rate, loop));
+}
+
+// A stream of an open file (ogg_open, ogg_open_memory); the stream owns it from then on.
+OggStream ogg_stream_from(OggVorbis ogg, int rate, bool loop) {
+    OggStream s;
+    s.ogg = ogg;
+    s.rate = rate > 0 ? rate : ogg.rate;
+    s.loop = loop;
+    s._step = (double)ogg.rate / (double)s.rate;
+    s._blk = alloc<float>(_OGG_BLOCK * (int64)(ogg.channels > 0 ? ogg.channels : 1));
+    OggStream_seek(&s, 0.0);
+    return s;
+}
+
+uint64 _ogg_loop_start(*OggStream s) {
+    return s.ogg.loop_end > s.ogg.loop_start ? s.ogg.loop_start : 0;
+}
+
+uint64 _ogg_loop_end(*OggStream s) {
+    return s.ogg.loop_end > s.ogg.loop_start ? s.ogg.loop_end : s.ogg.frames;
+}
+
+bool _ogg_stream_fill(*OggStream s) {
+    for (attempt in 0..2) {
+        int64 want = _OGG_BLOCK;
+        uint64 pos = OggVorbis_tell(&s.ogg);
+        if (s.loop) {
+            uint64 end = _ogg_loop_end(s);
+            if (pos >= end) {
+                OggVorbis_seek(&s.ogg, _ogg_loop_start(s));
+                pos = OggVorbis_tell(&s.ogg);
+            }
+            if ((uint64)want > end - pos) want = (int64)(end - pos);
+        }
+        int64 n = OggVorbis_read(&s.ogg, s._blk, want);
+        if (n > 0) {
+            s._blkn = n;
+            s._blkpos = 0;
+            s._blkat = pos;
+            return true;
+        }
+        if (!s.loop) return false;
+        OggVorbis_seek(&s.ogg, _ogg_loop_start(s));
+    }
+    return false;
+}
+
+bool _ogg_stream_frame(*OggStream s, *float l, *float r, *uint64 pos) {
+    if (s._blkpos >= s._blkn && !_ogg_stream_fill(s)) return false;
+    int ch = s.ogg.channels;
+    *float fr = s._blk + s._blkpos * (int64)ch;
+    *l = fr[0];
+    *r = ch > 1 ? fr[1] : fr[0];
+    *pos = s._blkat + (uint64)s._blkpos;
+    s._blkpos++;
+    return true;
+}
+
+// Writes up to frames stereo frames at the stream's rate into out (2 * frames floats);
+// fewer only at the end of a stream that does not loop.
+int64 OggStream_render(*OggStream self, *float out, int64 frames) {
+    int64 i = 0;
+    while (i < frames && self._a) {
+        float l = self._al;
+        float r = self._ar;
+        if (self._t > 0.0 && self._b) {
+            float t = (float)self._t;
+            l = l + (self._bl - l) * t;
+            r = r + (self._br - r) * t;
+        }
+        out[i * 2] = l;
+        out[i * 2 + 1] = r;
+        i++;
+        self._t = self._t + self._step;
+        while (self._t >= 1.0 && self._a) {
+            self._t = self._t - 1.0;
+            self._al = self._bl;
+            self._ar = self._br;
+            self._apos = self._bpos;
+            self._a = self._b;
+            if (self._b) self._b = _ogg_stream_frame(self, &self._bl, &self._br, &self._bpos);
+        }
+    }
+    if (!self._a) self._done = true;
+    return i;
+}
+
+// Whether a stream that does not loop has played its last frame.
+bool OggStream_done(*OggStream self) {
+    return self._done;
+}
+
+// Moves the stream to seconds into the file.
+void OggStream_seek(*OggStream self, double seconds) {
+    double at = seconds * (double)self.ogg.rate;
+    uint64 frame = at <= 0.0 ? 0 : (uint64)at;
+    OggVorbis_seek(&self.ogg, frame);
+    self._blkn = 0;
+    self._blkpos = 0;
+    self._t = 0.0;
+    self._a = _ogg_stream_frame(self, &self._al, &self._ar, &self._apos);
+    self._b = self._a && _ogg_stream_frame(self, &self._bl, &self._br, &self._bpos);
+    self._done = !self._a;
+}
+
+// Where the stream is in the file, in seconds.
+double OggStream_position(*OggStream self) {
+    return ((double)self._apos + self._t) / (double)self.ogg.rate;
+}
+
+// Frees the stream and its file.
+void OggStream_free(*OggStream self) {
+    OggVorbis_free(&self.ogg);
+    if (self._blk != null) free(self._blk);
+    self._blk = null;
+}

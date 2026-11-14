@@ -1,0 +1,480 @@
+// ogg_setup.esk: the setup: codebooks, floors, residues, mappings and modes (part of ogg.esk, which imports it in order after the ones before it)
+
+// ---------------------------------------------------------------------------------------
+// The setup: codebooks, floors, residues, mappings and modes.
+
+struct _OggCode {
+    uint32 code;
+    int sym;
+}
+
+int _ogg_code_cmp(*_OggCode a, *_OggCode b) {
+    if (a.code < b.code) return -1;
+    if (a.code > b.code) return 1;
+    return 0;
+}
+
+struct _OggBook {
+    int dim;
+    int entries;
+    // Code length per entry, 0 for an entry with no code.
+    *uint8 lens;
+    // Each entry's code, first bit lowest.
+    *uint32 codes;
+    // The entry for each value of the next 10 bits, or -1 when its code is longer.
+    *int fast;
+    // Codes longer than 10 bits, bit reversed and sorted, then their entries.
+    *uint32 sorted;
+    *int sorted_sym;
+    int nsorted;
+    // Each entry's vector (entries * dim), or null for a scalar codebook.
+    *float vq;
+}
+
+struct _OggFloor {
+    int partitions;
+    uint8[32] pclass;
+    uint8[16] cdim;
+    uint8[16] csub;
+    uint8[16] cmaster;
+    int16[16][8] subbooks;
+    int mult;
+    int values;
+    int[256] x;
+    uint8[256] order;
+    uint8[256] lo;
+    uint8[256] hi;
+}
+
+struct _OggResidue {
+    int type;
+    int64 begin;
+    int64 end;
+    int psize;
+    int classes;
+    int classbook;
+    int16[64][8] books;
+}
+
+struct _OggMapping {
+    int coupling;
+    uint8[256] mag;
+    uint8[256] ang;
+    uint8[256] mux;
+    int submaps;
+    uint8[16] sfloor;
+    uint8[16] sresidue;
+}
+
+struct _OggMode {
+    int blockflag;
+    int mapping;
+}
+
+// Per block size: its length, the transform's twiddle factors, its window and the
+// bit-reversal table.
+struct _OggBlock {
+    int n;
+    *float a;
+    *float b;
+    *float c;
+    *float win;
+    *uint16 rev;
+}
+
+struct _OggPiece {
+    uint64 at;
+    int64 len;
+}
+
+// A packet's bytes, the granule position of the page it ends (-1 on pages that give none),
+// and for audio packets: whether the block is long, and the stream positions of its center
+// (end) and of the end of the frames it gives (stop).
+struct _OggPacket {
+    int piece;
+    int npieces;
+    int64 size;
+    int64 granule;
+    int64 end;
+    int64 stop;
+    int block;
+}
+
+// An open Ogg Vorbis file: channels, rate, length in frames and loop points (loop_end 0
+// when the file has none), and the decoder's place in it. Read frames with read, move with
+// seek, and free it when done. Make one with ogg_open or ogg_open_memory.
+struct OggVorbis {
+    int channels;
+    int rate;
+    uint64 frames;
+    uint64 loop_start;
+    uint64 loop_end;
+    *uint8 _data;
+    uint64 _len;
+    List<_OggPiece> _pieces;
+    List<_OggPacket> _packets;
+    int _bs0;
+    int _bs1;
+    _OggBlock[2] _blk;
+    *_OggBook _books;
+    int _nbooks;
+    *_OggFloor _floors;
+    int _nfloors;
+    *_OggResidue _res;
+    int _nres;
+    *_OggMapping _maps;
+    int _nmaps;
+    _OggMode[64] _modes;
+    int _nmodes;
+    *float _buf;
+    *float _prevw;
+    int _prevlen;
+    *float _tmp;
+    *float _rtmp;
+    *int _cls;
+    *int _finaly;
+    *uint8 _pkt;
+    int64 _pktcap;
+    int64 _pktlen;
+    int _next;
+    int64 _pre;
+    int64 _endd;
+    int64 _cur;
+    int64 _outpos;
+    int _outfrom;
+    int _outcnt;
+}
+
+// The largest r with r to the power dim at most entries.
+int64 _ogg_lookup1(int64 entries, int dim) {
+    if (entries <= 0 || dim <= 0) return 0;
+    int64 r = (int64)floor(exp(log((double)entries) / (double)dim));
+    while (r > 0 && !_ogg_pow_le(r, dim, entries)) r--;
+    while (_ogg_pow_le(r + 1, dim, entries)) r++;
+    return r;
+}
+
+bool _ogg_pow_le(int64 b, int e, int64 limit) {
+    int64 acc = 1;
+    for (i in 0..e) {
+        acc = acc * b;
+        if (acc > limit) return false;
+    }
+    return true;
+}
+
+// Gives each entry its code from the lengths, as the specification assigns them: each
+// takes the lowest free branch of its length.
+bool _ogg_codewords(_OggBook* c) {
+    uint32[33] avail = {};
+    int n = c.entries;
+    int k = 0;
+    while (k < n && c.lens[k] == 0) k++;
+    if (k == n) return true;
+    c.codes[k] = 0;
+    for (i in 1..(int)c.lens[k] + 1) avail[i] = (uint32)1 << (uint32)(32 - i);
+    for (i in k + 1..n) {
+        int len = (int)c.lens[i];
+        if (len == 0) continue;
+        int z = len;
+        while (z > 0 && avail[z] == 0) z--;
+        if (z == 0) return false;
+        uint32 res = avail[z];
+        avail[z] = 0;
+        c.codes[i] = _ogg_rev(res);
+        for (int y = len; y > z; y--) avail[y] = res + ((uint32)1 << (uint32)(32 - y));
+    }
+    return true;
+}
+
+string _ogg_book(_OggBits* b, _OggBook* c, int64 limit_bits) {
+    if (_ogg_get(b, 24) != 0x564342) return "bad codebook";
+    c.dim = (int)_ogg_get(b, 16);
+    c.entries = (int)_ogg_get(b, 24);
+    bool ordered = _ogg_get(b, 1) != 0;
+    if (c.dim == 0 && c.entries != 0) return "bad codebook";
+    if (c.entries > (1 << 20)) return "codebook too large";
+    c.lens = alloc<uint8>((int64)c.entries + 1);
+    if (ordered) {
+        int cur = 0;
+        int len = (int)_ogg_get(b, 5) + 1;
+        while (cur < c.entries) {
+            int n = (int)_ogg_get(b, _ogg_ilog((int64)(c.entries - cur)));
+            if (b.eop || len > 31 || cur + n > c.entries) return "bad codebook lengths";
+            for (j in 0..n) c.lens[cur + j] = (uint8)len;
+            cur += n;
+            len++;
+        }
+    } else {
+        bool sparse = _ogg_get(b, 1) != 0;
+        if ((int64)c.entries > limit_bits) return "bad codebook";
+        for (j in 0..c.entries) {
+            bool present = sparse ? _ogg_get(b, 1) != 0 : true;
+            if (present) {
+                int len = (int)_ogg_get(b, 5) + 1;
+                if (len == 32) return "bad codebook lengths";
+                c.lens[j] = (uint8)len;
+            }
+        }
+    }
+    if (b.eop) return "truncated setup";
+    c.codes = alloc<uint32>((int64)c.entries + 1);
+    if (!_ogg_codewords(c)) return "bad codebook lengths";
+    c.fast = alloc<int>(_OGG_FAST);
+    for (i in 0.._OGG_FAST) c.fast[i] = -1;
+    int nsorted = 0;
+    for (i in 0..c.entries) {
+        int len = (int)c.lens[i];
+        if (len == 0) continue;
+        if (len > _OGG_FAST_BITS) {
+            nsorted++;
+            continue;
+        }
+        uint32 z = c.codes[i];
+        while (z < (uint32)_OGG_FAST) {
+            c.fast[z] = i;
+            z += (uint32)1 << (uint32)len;
+        }
+    }
+    c.nsorted = nsorted;
+    if (nsorted > 0) {
+        *_OggCode list = alloc<_OggCode>((int64)nsorted);
+        int k = 0;
+        for (i in 0..c.entries) {
+            if ((int)c.lens[i] > _OGG_FAST_BITS) {
+                list[k] = _OggCode{_ogg_rev(c.codes[i]), i};
+                k++;
+            }
+        }
+        sort<_OggCode>(list, nsorted, _ogg_code_cmp);
+        c.sorted = alloc<uint32>((int64)nsorted + 1);
+        c.sorted_sym = alloc<int>((int64)nsorted + 1);
+        for (i in 0..nsorted) {
+            c.sorted[i] = list[i].code;
+            c.sorted_sym[i] = list[i].sym;
+        }
+        free(list);
+    }
+    int lookup = (int)_ogg_get(b, 4);
+    if (lookup > 2) return "bad codebook lookup";
+    if (lookup == 0) return null;
+    float minv = _ogg_float32(_ogg_get(b, 32));
+    float delta = _ogg_float32(_ogg_get(b, 32));
+    int vbits = (int)_ogg_get(b, 4) + 1;
+    bool seq = _ogg_get(b, 1) != 0;
+    int64 nvals = lookup == 1 ? _ogg_lookup1((int64)c.entries, c.dim) : (int64)c.entries * (int64)c.dim;
+    if (nvals <= 0 || nvals * (int64)vbits > limit_bits) return "bad codebook lookup";
+    if ((int64)c.entries * (int64)c.dim > (int64)(1 << 24)) return "codebook too large";
+    *uint32 mults = alloc<uint32>(nvals);
+    defer free(mults);
+    for (j in 0..nvals) mults[j] = _ogg_get(b, vbits);
+    if (b.eop) return "truncated setup";
+    c.vq = alloc<float>((int64)c.entries * (int64)c.dim + 1);
+    for (e in 0..(int64)c.entries) {
+        float last = 0.0;
+        int64 div = 1;
+        for (d in 0..(int64)c.dim) {
+            int64 off = lookup == 1 ? (e / div) % nvals : e * (int64)c.dim + d;
+            float val = (float)mults[off] * delta + minv + last;
+            c.vq[e * (int64)c.dim + d] = val;
+            if (seq) last = val;
+            if (lookup == 1 && div <= (int64)c.entries) div = div * nvals;
+        }
+    }
+    return null;
+}
+
+string _ogg_floor(_OggBits* b, *OggVorbis f, _OggFloor* g) {
+    int type = (int)_ogg_get(b, 16);
+    if (type == 0) return "floor 0 is not supported";
+    if (type != 1) return "bad floor";
+    g.partitions = (int)_ogg_get(b, 5);
+    int maxclass = -1;
+    for (j in 0..g.partitions) {
+        g.pclass[j] = (uint8)_ogg_get(b, 4);
+        if ((int)g.pclass[j] > maxclass) maxclass = (int)g.pclass[j];
+    }
+    for (j in 0..maxclass + 1) {
+        g.cdim[j] = (uint8)(_ogg_get(b, 3) + 1);
+        g.csub[j] = (uint8)_ogg_get(b, 2);
+        if (g.csub[j] != 0) {
+            g.cmaster[j] = (uint8)_ogg_get(b, 8);
+            if ((int)g.cmaster[j] >= f._nbooks) return "bad floor";
+        }
+        for (k in 0..(1 << (int)g.csub[j])) {
+            int book = (int)_ogg_get(b, 8) - 1;
+            if (book >= f._nbooks) return "bad floor";
+            g.subbooks[j][k] = (int16)book;
+        }
+    }
+    g.mult = (int)_ogg_get(b, 2) + 1;
+    int rbits = (int)_ogg_get(b, 4);
+    g.x[0] = 0;
+    g.x[1] = 1 << rbits;
+    g.values = 2;
+    for (j in 0..g.partitions) {
+        int c = (int)g.pclass[j];
+        for (k in 0..(int)g.cdim[c]) {
+            g.x[g.values] = (int)_ogg_get(b, rbits);
+            g.values++;
+        }
+    }
+    if (b.eop) return "truncated setup";
+    _OggCode[256] p;
+    for (j in 0..g.values) p[j] = _OggCode{(uint32)g.x[j], j};
+    sort<_OggCode>(&p[0], g.values, _ogg_code_cmp);
+    for (j in 0..g.values - 1) {
+        if (p[j].code == p[j + 1].code) return "bad floor";
+    }
+    for (j in 0..g.values) g.order[j] = (uint8)p[j].sym;
+    for (j in 2..g.values) {
+        int low = -1;
+        int high = 65536;
+        int lo = 0;
+        int hi = 0;
+        for (i in 0..j) {
+            if (g.x[i] > low && g.x[i] < g.x[j]) {
+                lo = i;
+                low = g.x[i];
+            }
+            if (g.x[i] < high && g.x[i] > g.x[j]) {
+                hi = i;
+                high = g.x[i];
+            }
+        }
+        g.lo[j] = (uint8)lo;
+        g.hi[j] = (uint8)hi;
+    }
+    return null;
+}
+
+string _ogg_residue_setup(_OggBits* b, *OggVorbis f, _OggResidue* r) {
+    r.type = (int)_ogg_get(b, 16);
+    if (r.type > 2) return "bad residue";
+    r.begin = (int64)_ogg_get(b, 24);
+    r.end = (int64)_ogg_get(b, 24);
+    if (r.end < r.begin) return "bad residue";
+    r.psize = (int)_ogg_get(b, 24) + 1;
+    r.classes = (int)_ogg_get(b, 6) + 1;
+    r.classbook = (int)_ogg_get(b, 8);
+    if (r.classbook >= f._nbooks) return "bad residue";
+    int[64] cascade;
+    for (j in 0..r.classes) {
+        int low = (int)_ogg_get(b, 3);
+        int high = _ogg_get(b, 1) != 0 ? (int)_ogg_get(b, 5) : 0;
+        cascade[j] = high * 8 + low;
+    }
+    for (j in 0..r.classes) {
+        for (k in 0..8) {
+            if ((cascade[j] & (1 << k)) != 0) {
+                int book = (int)_ogg_get(b, 8);
+                if (book >= f._nbooks) return "bad residue";
+                r.books[j][k] = (int16)book;
+            } else r.books[j][k] = -1;
+        }
+    }
+    return null;
+}
+
+string _ogg_mapping(_OggBits* b, *OggVorbis f, _OggMapping* m) {
+    if (_ogg_get(b, 16) != 0) return "bad mapping";
+    m.submaps = _ogg_get(b, 1) != 0 ? (int)_ogg_get(b, 4) + 1 : 1;
+    if (_ogg_get(b, 1) != 0) {
+        m.coupling = (int)_ogg_get(b, 8) + 1;
+        if (m.coupling > f.channels) return "bad mapping";
+        int bits = _ogg_ilog((int64)(f.channels - 1));
+        for (k in 0..m.coupling) {
+            m.mag[k] = (uint8)_ogg_get(b, bits);
+            m.ang[k] = (uint8)_ogg_get(b, bits);
+            if ((int)m.mag[k] >= f.channels || (int)m.ang[k] >= f.channels || m.mag[k] == m.ang[k]) return "bad mapping";
+        }
+    }
+    if (_ogg_get(b, 2) != 0) return "bad mapping";
+    for (j in 0..f.channels) {
+        m.mux[j] = m.submaps > 1 ? (uint8)_ogg_get(b, 4) : 0;
+        if ((int)m.mux[j] >= m.submaps) return "bad mapping";
+    }
+    for (j in 0..m.submaps) {
+        _ogg_get(b, 8);
+        m.sfloor[j] = (uint8)_ogg_get(b, 8);
+        m.sresidue[j] = (uint8)_ogg_get(b, 8);
+        if ((int)m.sfloor[j] >= f._nfloors || (int)m.sresidue[j] >= f._nres) return "bad mapping";
+    }
+    return null;
+}
+
+string _ogg_setup(*OggVorbis f, *uint8 p, int64 len) {
+    if (len < 7 || p[0] != 5 || memcmp(p + 1, "vorbis", 6) != 0) return "no setup header";
+    _OggBits b = _OggBits{p: p, len: len, at: 7};
+    int64 limit = len * 8;
+    f._nbooks = (int)_ogg_get(&b, 8) + 1;
+    f._books = alloc<_OggBook>((int64)f._nbooks);
+    for (i in 0..f._nbooks) {
+        string err = _ogg_book(&b, &f._books[i], limit);
+        if (err != null) return err;
+    }
+    int times = (int)_ogg_get(&b, 6) + 1;
+    for (i in 0..times) {
+        if (_ogg_get(&b, 16) != 0) return "bad setup";
+    }
+    f._nfloors = (int)_ogg_get(&b, 6) + 1;
+    f._floors = alloc<_OggFloor>((int64)f._nfloors);
+    for (i in 0..f._nfloors) {
+        string err = _ogg_floor(&b, f, &f._floors[i]);
+        if (err != null) return err;
+    }
+    f._nres = (int)_ogg_get(&b, 6) + 1;
+    f._res = alloc<_OggResidue>((int64)f._nres);
+    for (i in 0..f._nres) {
+        string err = _ogg_residue_setup(&b, f, &f._res[i]);
+        if (err != null) return err;
+    }
+    f._nmaps = (int)_ogg_get(&b, 6) + 1;
+    f._maps = alloc<_OggMapping>((int64)f._nmaps);
+    for (i in 0..f._nmaps) {
+        string err = _ogg_mapping(&b, f, &f._maps[i]);
+        if (err != null) return err;
+    }
+    f._nmodes = (int)_ogg_get(&b, 6) + 1;
+    for (i in 0..f._nmodes) {
+        f._modes[i].blockflag = (int)_ogg_get(&b, 1);
+        uint32 window = _ogg_get(&b, 16);
+        uint32 transform = _ogg_get(&b, 16);
+        f._modes[i].mapping = (int)_ogg_get(&b, 8);
+        if (window != 0 || transform != 0 || f._modes[i].mapping >= f._nmaps) return "bad mode";
+    }
+    if (b.eop) return "truncated setup";
+    return null;
+}
+
+void _ogg_block_init(_OggBlock* k, int n) {
+    int n2 = n >> 1;
+    int n4 = n >> 2;
+    int n8 = n >> 3;
+    k.n = n;
+    k.a = alloc<float>((int64)n2);
+    k.b = alloc<float>((int64)n2);
+    k.c = alloc<float>((int64)n4);
+    k.win = alloc<float>((int64)n2);
+    k.rev = alloc<uint16>((int64)n8);
+    double dn = (double)n;
+    for (i in 0..n4) {
+        int i2 = i * 2;
+        k.a[i2] = (float)cos((double)(4 * i) * _OGG_PI / dn);
+        k.a[i2 + 1] = (float)(0.0 - sin((double)(4 * i) * _OGG_PI / dn));
+        k.b[i2] = (float)cos((double)(i2 + 1) * _OGG_PI / dn / 2.0) * 0.5;
+        k.b[i2 + 1] = (float)sin((double)(i2 + 1) * _OGG_PI / dn / 2.0) * 0.5;
+    }
+    for (i in 0..n8) {
+        int i2 = i * 2;
+        k.c[i2] = (float)cos((double)(2 * (i2 + 1)) * _OGG_PI / dn);
+        k.c[i2 + 1] = (float)(0.0 - sin((double)(2 * (i2 + 1)) * _OGG_PI / dn));
+    }
+    for (i in 0..n2) {
+        float s = (float)sin(((double)i + 0.5) / (double)n2 * 0.5 * _OGG_PI);
+        float sq = s * s;
+        k.win[i] = (float)sin(0.5 * _OGG_PI * (double)sq);
+    }
+    int ld = _ogg_ilog((int64)n) - 1;
+    for (i in 0..n8) k.rev[i] = (uint16)((_ogg_rev((uint32)i) >> (uint32)(32 - ld + 3)) << 2);
+}

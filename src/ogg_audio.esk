@@ -1,0 +1,755 @@
+// ogg_audio.esk: pages, packets and audio packets (part of ogg.esk, which imports it in order after the ones before it)
+
+// ---------------------------------------------------------------------------------------
+// Pages and packets.
+
+void _ogg_add_piece(*OggVorbis f, _OggPacket* pk, uint64 at, int64 len) {
+    if (len == 0) return;
+    if (pk.npieces > 0) {
+        _OggPiece* last = &f._pieces.data[f._pieces.size - 1];
+        if (last.at + (uint64)last.len == at) {
+            last.len += len;
+            pk.size += len;
+            return;
+        }
+    }
+    List_push(&f._pieces, _OggPiece{at, len});
+    pk.npieces++;
+    pk.size += len;
+}
+
+// Splits the file into the packets of its first logical stream, noting the granule
+// position of the last packet each page completes.
+void _ogg_pages(*OggVorbis f) {
+    *uint8 d = f._data;
+    uint64 len = f._len;
+    uint64 at = 0;
+    bool have_serial = false;
+    uint32 serial = 0;
+    bool open = false;
+    _OggPacket cur;
+    while (at + 27 <= len) {
+        if (!(d[at] == 'O' && d[at + 1] == 'g' && d[at + 2] == 'g' && d[at + 3] == 'S')) {
+            at++;
+            continue;
+        }
+        uint64 nseg = (uint64)d[at + 26];
+        uint64 body = at + 27 + nseg;
+        if (body > len) break;
+        uint64 size = 0;
+        for (s in 0..nseg) size += (uint64)d[at + 27 + s];
+        if (body + size > len) break;
+        uint64 next = body + size;
+        uint32 ser = _ogg_u32(d + at + 14);
+        if (d[at + 4] != 0 || (have_serial && ser != serial)) {
+            at = next;
+            continue;
+        }
+        have_serial = true;
+        serial = ser;
+        int flags = (int)d[at + 5];
+        int64 granule = (int64)((uint64)_ogg_u32(d + at + 6) | (uint64)_ogg_u32(d + at + 10) << 32);
+        if ((flags & 1) == 0) open = false;
+        bool skipping = (flags & 1) != 0 && !open;
+        uint64 p = body;
+        bool completed = false;
+        for (s in 0..nseg) {
+            int64 lace = (int64)d[at + 27 + s];
+            if (!skipping) {
+                if (!open) {
+                    cur = _OggPacket{piece: f._pieces.size, granule: -1};
+                    open = true;
+                }
+                _ogg_add_piece(f, &cur, p, lace);
+            }
+            p += (uint64)lace;
+            if (lace < 255) {
+                if (skipping) skipping = false;
+                else {
+                    List_push(&f._packets, cur);
+                    open = false;
+                    completed = true;
+                }
+            }
+        }
+        if (completed && granule != -1) f._packets.data[f._packets.size - 1].granule = granule;
+        at = next;
+        if ((flags & 4) != 0) break;
+    }
+}
+
+// Copies a packet's bytes together into _pkt.
+void _ogg_assemble(*OggVorbis f, _OggPacket* pk) {
+    if (pk.size > f._pktcap) {
+        if (f._pkt != null) free(f._pkt);
+        f._pktcap = pk.size + 1024;
+        f._pkt = alloc<uint8>(f._pktcap);
+    }
+    int64 at = 0;
+    for (i in 0..pk.npieces) {
+        _OggPiece* piece = &f._pieces.data[pk.piece + i];
+        memcpy(f._pkt + at, f._data + piece.at, piece.len);
+        at += piece.len;
+    }
+    f._pktlen = at;
+}
+
+// ---------------------------------------------------------------------------------------
+// Audio packets.
+
+// The entry of codebook c the next bits code, or -1 (and eop) when they code none.
+int _ogg_scalar(_OggBits* b, _OggBook* c) {
+    if (b.bits < 32) _ogg_fill(b);
+    uint32 low = (uint32)b.acc;
+    int s = c.fast[low & (uint32)(_OGG_FAST - 1)];
+    if (s < 0) {
+        if (c.nsorted == 0) {
+            b.eop = true;
+            b.bits = 0;
+            return -1;
+        }
+        uint32 code = _ogg_rev(low);
+        int x = 0;
+        int n = c.nsorted;
+        while (n > 1) {
+            int m = x + (n >> 1);
+            if (c.sorted[m] <= code) {
+                x = m;
+                n -= n >> 1;
+            } else n = n >> 1;
+        }
+        s = c.sorted_sym[x];
+    }
+    int len = (int)c.lens[s];
+    if (len > b.bits) {
+        b.eop = true;
+        b.bits = 0;
+        b.acc = 0;
+        return -1;
+    }
+    b.acc = b.acc >> (uint64)len;
+    b.bits -= len;
+    return s;
+}
+
+int _ogg_predict(int x, int x0, int x1, int y0, int y1) {
+    int dy = y1 - y0;
+    int adx = x1 - x0;
+    int off = abs(dy) * (x - x0) / adx;
+    return dy < 0 ? y0 - off : y0 + off;
+}
+
+// Reads a channel's floor into y; false when the channel is silent (or the packet ends).
+// Points that do not shape the curve are -1.
+bool _ogg_floor_decode(_OggBits* b, *OggVorbis f, _OggFloor* g, *int y) {
+    if (_ogg_get(b, 1) == 0) return false;
+    int[4] ranges = {256, 128, 86, 64};
+    int range = ranges[g.mult - 1];
+    int rbits = _ogg_ilog((int64)(range - 1));
+    y[0] = (int)_ogg_get(b, rbits);
+    y[1] = (int)_ogg_get(b, rbits);
+    int off = 2;
+    for (j in 0..g.partitions) {
+        int cls = (int)g.pclass[j];
+        int cdim = (int)g.cdim[cls];
+        int cbits = (int)g.csub[cls];
+        int csub = (1 << cbits) - 1;
+        int cval = 0;
+        if (cbits > 0) cval = _ogg_scalar(b, &f._books[g.cmaster[cls]]);
+        for (k in 0..cdim) {
+            int book = (int)g.subbooks[cls][cval & csub];
+            cval = cval >> cbits;
+            if (book >= 0) y[off] = _ogg_scalar(b, &f._books[book]);
+            else y[off] = 0;
+            off++;
+        }
+    }
+    if (b.eop) return false;
+    bool[256] step2;
+    step2[0] = true;
+    step2[1] = true;
+    for (j in 2..g.values) {
+        int lo = (int)g.lo[j];
+        int hi = (int)g.hi[j];
+        int pred = _ogg_predict(g.x[j], g.x[lo], g.x[hi], y[lo], y[hi]);
+        int val = y[j];
+        int highroom = range - pred;
+        int lowroom = pred;
+        int room = highroom < lowroom ? highroom * 2 : lowroom * 2;
+        if (val != 0) {
+            step2[lo] = true;
+            step2[hi] = true;
+            step2[j] = true;
+            if (val >= room) {
+                if (highroom > lowroom) y[j] = val - lowroom + pred;
+                else y[j] = pred - val + highroom - 1;
+            } else if ((val & 1) != 0) y[j] = pred - ((val + 1) >> 1);
+            else y[j] = pred + (val >> 1);
+        } else {
+            step2[j] = false;
+            y[j] = pred;
+        }
+    }
+    for (j in 0..g.values) {
+        if (!step2[j]) y[j] = -1;
+    }
+    return true;
+}
+
+void _ogg_line(*float out, int x0, int y0, int x1, int y1, int n) {
+    int dy = y1 - y0;
+    int adx = x1 - x0;
+    int ady = abs(dy);
+    int base = dy / adx;
+    int sy = dy < 0 ? base - 1 : base + 1;
+    int x = x0;
+    int y = y0;
+    int err = 0;
+    ady -= abs(base) * adx;
+    if (x1 > n) x1 = n;
+    if (x < x1) {
+        out[x] *= _OGG_DB[y & 255];
+        x++;
+        while (x < x1) {
+            err += ady;
+            if (err >= adx) {
+                err -= adx;
+                y += sy;
+            } else y += base;
+            out[x] *= _OGG_DB[y & 255];
+            x++;
+        }
+    }
+}
+
+// Multiplies the spectrum by the floor curve.
+void _ogg_floor_apply(_OggFloor* g, *int y, *float out, int n2) {
+    int lx = 0;
+    int ly = y[0] * g.mult;
+    for (q in 1..g.values) {
+        int j = (int)g.order[q];
+        if (y[j] >= 0) {
+            int hy = y[j] * g.mult;
+            int hx = g.x[j];
+            if (lx != hx) _ogg_line(out, lx, ly, hx, hy, n2);
+            lx = hx;
+            ly = hy;
+        }
+    }
+    for (j in lx..n2) out[j] *= _OGG_DB[ly & 255];
+}
+
+// Adds one partition of n values, read with book c, to v at off (type 0 interleaves them).
+bool _ogg_residue_part(_OggBits* b, _OggBook* c, *float v, int64 off, int n, int type) {
+    if (c.vq == null) return false;
+    int dim = c.dim;
+    if (type == 0) {
+        int step = n / dim;
+        for (i in 0..step) {
+            int z = _ogg_scalar(b, c);
+            if (z < 0) return false;
+            *float e = c.vq + (int64)z * (int64)dim;
+            for (d in 0..dim) v[off + (int64)i + (int64)(d * step)] += e[d];
+        }
+        return true;
+    }
+    int i = 0;
+    while (i < n) {
+        int z = _ogg_scalar(b, c);
+        if (z < 0) return false;
+        *float e = c.vq + (int64)z * (int64)dim;
+        for (d in 0..dim) {
+            if (i >= n) break;
+            v[off + (int64)i] += e[d];
+            i++;
+        }
+    }
+    return true;
+}
+
+// Decodes residue r into the nch vectors of size values each (those marked skip stay as
+// they are), as types 0 and 1 lay them out.
+void _ogg_residue_vectors(_OggBits* b, *OggVorbis f, _OggResidue* r, **float vecs, *bool skip, int nch, int size, int type) {
+    int64 begin = r.begin < (int64)size ? r.begin : (int64)size;
+    int64 end = r.end < (int64)size ? r.end : (int64)size;
+    int parts = (int)((end - begin) / (int64)r.psize);
+    if (parts <= 0) return;
+    _OggBook* cb = &f._books[r.classbook];
+    int cw = cb.dim;
+    if (cw <= 0) return;
+    int stride = parts + cw;
+    *int cls = f._cls;
+    for (pass in 0..8) {
+        int pc = 0;
+        while (pc < parts) {
+            if (pass == 0) {
+                for (j in 0..nch) {
+                    if (skip[j]) continue;
+                    int q = _ogg_scalar(b, cb);
+                    if (q < 0) return;
+                    for (int i = cw - 1; i >= 0; i--) {
+                        cls[j * stride + i + pc] = q % r.classes;
+                        q = q / r.classes;
+                    }
+                }
+            }
+            for (int i = 0; i < cw && pc < parts; i++) {
+                for (j in 0..nch) {
+                    if (skip[j]) continue;
+                    int book = (int)r.books[cls[j * stride + pc]][pass];
+                    if (book < 0) continue;
+                    if (!_ogg_residue_part(b, &f._books[book], vecs[j], begin + (int64)pc * (int64)r.psize, r.psize, type)) return;
+                }
+                pc++;
+            }
+        }
+    }
+}
+
+void _ogg_residue(_OggBits* b, *OggVorbis f, int ri, *int chans, *bool skip, int nch, int n2) {
+    _OggResidue* r = &f._res[ri];
+    *float[256] vecs;
+    if (r.type == 2 && nch > 1) {
+        bool any = false;
+        for (j in 0..nch) {
+            if (!skip[j]) any = true;
+        }
+        if (!any) return;
+        int total = n2 * nch;
+        memset(f._rtmp, 0, (int64)total * 4);
+        bool[1] none = {false};
+        vecs[0] = f._rtmp;
+        _ogg_residue_vectors(b, f, r, &vecs[0], &none[0], 1, total, 1);
+        for (j in 0..nch) {
+            *float v = f._buf + (int64)chans[j] * (int64)f._bs1;
+            for (i in 0..n2) v[i] = f._rtmp[i * nch + j];
+        }
+        return;
+    }
+    for (j in 0..nch) vecs[j] = f._buf + (int64)chans[j] * (int64)f._bs1;
+    _ogg_residue_vectors(b, f, r, &vecs[0], skip, nch, n2, r.type == 0 ? 0 : 1);
+}
+
+// The inverse MDCT of the n/2 coefficients in buf into n samples, in place (stb_vorbis's
+// version of the algorithm from "The use of multirate filter banks for coding of high
+// quality digital audio").
+void _ogg_imdct(*OggVorbis f, *float buf, int n, int bt) {
+    int n2 = n >> 1;
+    int n4 = n >> 2;
+    int n8 = n >> 3;
+    *float v = f._tmp;
+    *float u = buf;
+    _OggBlock* blk = &f._blk[bt];
+    *float a = blk.a;
+    int d = n2 - 2;
+    int aa = 0;
+    int e = 0;
+    while (e != n2) {
+        v[d + 1] = u[e] * a[aa] - u[e + 2] * a[aa + 1];
+        v[d] = u[e] * a[aa + 1] + u[e + 2] * a[aa];
+        d -= 2;
+        aa += 2;
+        e += 4;
+    }
+    e = n2 - 3;
+    while (d >= 0) {
+        v[d + 1] = (0.0 - u[e + 2]) * a[aa] - (0.0 - u[e]) * a[aa + 1];
+        v[d] = (0.0 - u[e + 2]) * a[aa + 1] + (0.0 - u[e]) * a[aa];
+        d -= 2;
+        aa += 2;
+        e -= 4;
+    }
+    aa = n2 - 8;
+    int e0 = n4;
+    int e1 = 0;
+    int d0 = n4;
+    int d1 = 0;
+    while (aa >= 0) {
+        float v41 = v[e0 + 1] - v[e1 + 1];
+        float v40 = v[e0] - v[e1];
+        u[d0 + 1] = v[e0 + 1] + v[e1 + 1];
+        u[d0] = v[e0] + v[e1];
+        u[d1 + 1] = v41 * a[aa + 4] - v40 * a[aa + 5];
+        u[d1] = v40 * a[aa + 4] + v41 * a[aa + 5];
+        v41 = v[e0 + 3] - v[e1 + 3];
+        v40 = v[e0 + 2] - v[e1 + 2];
+        u[d0 + 3] = v[e0 + 3] + v[e1 + 3];
+        u[d0 + 2] = v[e0 + 2] + v[e1 + 2];
+        u[d1 + 3] = v41 * a[aa] - v40 * a[aa + 1];
+        u[d1 + 2] = v40 * a[aa] + v41 * a[aa + 1];
+        aa -= 8;
+        d0 += 4;
+        d1 += 4;
+        e0 += 4;
+        e1 += 4;
+    }
+    int ld = _ogg_ilog((int64)n) - 1;
+    _ogg_step3_iter0(n >> 4, u, n2 - 1 - n4 * 0, 0 - (n >> 3), a);
+    _ogg_step3_iter0(n >> 4, u, n2 - 1 - n4 * 1, 0 - (n >> 3), a);
+    for (i in 0..4) _ogg_step3_r(n >> 5, u, n2 - 1 - n8 * i, 0 - (n >> 4), a, 16);
+    int l = 2;
+    while (l < (ld - 3) >> 1) {
+        int k0 = n >> (l + 2);
+        int lim = 1 << (l + 1);
+        for (i in 0..lim) _ogg_step3_r(n >> (l + 4), u, n2 - 1 - k0 * i, 0 - (k0 >> 1), a, 1 << (l + 3));
+        l++;
+    }
+    while (l < ld - 6) {
+        int k0 = n >> (l + 2);
+        int k1 = 1 << (l + 3);
+        int rlim = n >> (l + 6);
+        int lim = 1 << (l + 1);
+        int ioff = n2 - 1;
+        int a0 = 0;
+        for (int r = rlim; r > 0; r--) {
+            _ogg_step3_s(lim, u, ioff, 0 - (k0 >> 1), a, a0, k1, k0);
+            a0 += k1 * 4;
+            ioff -= 8;
+        }
+        l++;
+    }
+    _ogg_step3_ld654(n >> 5, u, n2 - 1, a, n);
+    *uint16 rev = blk.rev;
+    int br = 0;
+    d0 = n4 - 4;
+    d1 = n2 - 4;
+    while (d0 >= 0) {
+        int k4 = (int)rev[br];
+        v[d1 + 3] = u[k4];
+        v[d1 + 2] = u[k4 + 1];
+        v[d0 + 3] = u[k4 + 2];
+        v[d0 + 2] = u[k4 + 3];
+        k4 = (int)rev[br + 1];
+        v[d1 + 1] = u[k4];
+        v[d1] = u[k4 + 1];
+        v[d0 + 1] = u[k4 + 2];
+        v[d0] = u[k4 + 3];
+        d0 -= 4;
+        d1 -= 4;
+        br += 2;
+    }
+    *float c = blk.c;
+    int ci = 0;
+    d = 0;
+    e = n2 - 4;
+    while (d < e) {
+        float a02 = v[d] - v[e + 2];
+        float a11 = v[d + 1] + v[e + 3];
+        float b0 = c[ci + 1] * a02 + c[ci] * a11;
+        float b1 = c[ci + 1] * a11 - c[ci] * a02;
+        float b2 = v[d] + v[e + 2];
+        float b3 = v[d + 1] - v[e + 3];
+        v[d] = b2 + b0;
+        v[d + 1] = b3 + b1;
+        v[e + 2] = b2 - b0;
+        v[e + 3] = b1 - b3;
+        a02 = v[d + 2] - v[e];
+        a11 = v[d + 3] + v[e + 1];
+        b0 = c[ci + 3] * a02 + c[ci + 2] * a11;
+        b1 = c[ci + 3] * a11 - c[ci + 2] * a02;
+        b2 = v[d + 2] + v[e];
+        b3 = v[d + 3] - v[e + 1];
+        v[d + 2] = b2 + b0;
+        v[d + 3] = b3 + b1;
+        v[e] = b2 - b0;
+        v[e + 1] = b1 - b3;
+        ci += 4;
+        d += 4;
+        e -= 4;
+    }
+    *float bb = blk.b;
+    int bi = n2 - 8;
+    e = n2 - 8;
+    d0 = 0;
+    d1 = n2 - 4;
+    int d2 = n2;
+    int d3 = n - 4;
+    while (e >= 0) {
+        float p3 = v[e + 6] * bb[bi + 7] - v[e + 7] * bb[bi + 6];
+        float p2 = (0.0 - v[e + 6]) * bb[bi + 6] - v[e + 7] * bb[bi + 7];
+        buf[d0] = p3;
+        buf[d1 + 3] = 0.0 - p3;
+        buf[d2] = p2;
+        buf[d3 + 3] = p2;
+        float p1 = v[e + 4] * bb[bi + 5] - v[e + 5] * bb[bi + 4];
+        float p0 = (0.0 - v[e + 4]) * bb[bi + 4] - v[e + 5] * bb[bi + 5];
+        buf[d0 + 1] = p1;
+        buf[d1 + 2] = 0.0 - p1;
+        buf[d2 + 1] = p0;
+        buf[d3 + 2] = p0;
+        p3 = v[e + 2] * bb[bi + 3] - v[e + 3] * bb[bi + 2];
+        p2 = (0.0 - v[e + 2]) * bb[bi + 2] - v[e + 3] * bb[bi + 3];
+        buf[d0 + 2] = p3;
+        buf[d1 + 1] = 0.0 - p3;
+        buf[d2 + 2] = p2;
+        buf[d3 + 1] = p2;
+        p1 = v[e] * bb[bi + 1] - v[e + 1] * bb[bi];
+        p0 = (0.0 - v[e]) * bb[bi] - v[e + 1] * bb[bi + 1];
+        buf[d0 + 3] = p1;
+        buf[d1] = 0.0 - p1;
+        buf[d2 + 3] = p0;
+        buf[d3] = p0;
+        bi -= 8;
+        e -= 8;
+        d0 += 4;
+        d2 += 4;
+        d1 -= 4;
+        d3 -= 4;
+    }
+}
+
+void _ogg_butterfly(*float x, int i0, int i2, float a0, float a1) {
+    float k00 = x[i0] - x[i2];
+    float k11 = x[i0 - 1] - x[i2 - 1];
+    x[i0] = x[i0] + x[i2];
+    x[i0 - 1] = x[i0 - 1] + x[i2 - 1];
+    x[i2] = k00 * a0 - k11 * a1;
+    x[i2 - 1] = k11 * a0 + k00 * a1;
+}
+
+void _ogg_step3_iter0(int n, *float e, int ioff, int koff, *float a) {
+    int i0 = ioff;
+    int i2 = ioff + koff;
+    int ai = 0;
+    for (int i = n >> 2; i > 0; i--) {
+        _ogg_butterfly(e, i0, i2, a[ai], a[ai + 1]);
+        ai += 8;
+        _ogg_butterfly(e, i0 - 2, i2 - 2, a[ai], a[ai + 1]);
+        ai += 8;
+        _ogg_butterfly(e, i0 - 4, i2 - 4, a[ai], a[ai + 1]);
+        ai += 8;
+        _ogg_butterfly(e, i0 - 6, i2 - 6, a[ai], a[ai + 1]);
+        ai += 8;
+        i0 -= 8;
+        i2 -= 8;
+    }
+}
+
+void _ogg_step3_r(int lim, *float e, int d0, int koff, *float a, int k1) {
+    int i0 = d0;
+    int i2 = d0 + koff;
+    int ai = 0;
+    for (int i = lim >> 2; i > 0; i--) {
+        _ogg_butterfly(e, i0, i2, a[ai], a[ai + 1]);
+        ai += k1;
+        _ogg_butterfly(e, i0 - 2, i2 - 2, a[ai], a[ai + 1]);
+        ai += k1;
+        _ogg_butterfly(e, i0 - 4, i2 - 4, a[ai], a[ai + 1]);
+        ai += k1;
+        _ogg_butterfly(e, i0 - 6, i2 - 6, a[ai], a[ai + 1]);
+        ai += k1;
+        i0 -= 8;
+        i2 -= 8;
+    }
+}
+
+void _ogg_step3_s(int n, *float e, int ioff, int koff, *float a, int a0, int aoff, int k0) {
+    float c0 = a[a0];
+    float c1 = a[a0 + 1];
+    float c2 = a[a0 + aoff];
+    float c3 = a[a0 + aoff + 1];
+    float c4 = a[a0 + aoff * 2];
+    float c5 = a[a0 + aoff * 2 + 1];
+    float c6 = a[a0 + aoff * 3];
+    float c7 = a[a0 + aoff * 3 + 1];
+    int i0 = ioff;
+    int i2 = ioff + koff;
+    for (int i = n; i > 0; i--) {
+        _ogg_butterfly(e, i0, i2, c0, c1);
+        _ogg_butterfly(e, i0 - 2, i2 - 2, c2, c3);
+        _ogg_butterfly(e, i0 - 4, i2 - 4, c4, c5);
+        _ogg_butterfly(e, i0 - 6, i2 - 6, c6, c7);
+        i0 -= k0;
+        i2 -= k0;
+    }
+}
+
+void _ogg_iter54(*float x, int z) {
+    float k00 = x[z] - x[z - 4];
+    float y0 = x[z] + x[z - 4];
+    float y2 = x[z - 2] + x[z - 6];
+    float k22 = x[z - 2] - x[z - 6];
+    x[z] = y0 + y2;
+    x[z - 2] = y0 - y2;
+    float k33 = x[z - 3] - x[z - 7];
+    x[z - 4] = k00 + k33;
+    x[z - 6] = k00 - k33;
+    float k11 = x[z - 1] - x[z - 5];
+    float y1 = x[z - 1] + x[z - 5];
+    float y3 = x[z - 3] + x[z - 7];
+    x[z - 1] = y1 + y3;
+    x[z - 3] = y1 - y3;
+    x[z - 5] = k11 - k22;
+    x[z - 7] = k11 + k22;
+}
+
+void _ogg_step3_ld654(int n, *float x, int ioff, *float a, int base_n) {
+    float a2 = a[base_n >> 3];
+    int z = ioff;
+    int base = z - 16 * n;
+    while (z > base) {
+        float k00 = x[z] - x[z - 8];
+        float k11 = x[z - 1] - x[z - 9];
+        float l00 = x[z - 2] - x[z - 10];
+        float l11 = x[z - 3] - x[z - 11];
+        x[z] = x[z] + x[z - 8];
+        x[z - 1] = x[z - 1] + x[z - 9];
+        x[z - 2] = x[z - 2] + x[z - 10];
+        x[z - 3] = x[z - 3] + x[z - 11];
+        x[z - 8] = k00;
+        x[z - 9] = k11;
+        x[z - 10] = (l00 + l11) * a2;
+        x[z - 11] = (l11 - l00) * a2;
+        k00 = x[z - 4] - x[z - 12];
+        k11 = x[z - 5] - x[z - 13];
+        l00 = x[z - 6] - x[z - 14];
+        l11 = x[z - 7] - x[z - 15];
+        x[z - 4] = x[z - 4] + x[z - 12];
+        x[z - 5] = x[z - 5] + x[z - 13];
+        x[z - 6] = x[z - 6] + x[z - 14];
+        x[z - 7] = x[z - 7] + x[z - 15];
+        x[z - 12] = k11;
+        x[z - 13] = 0.0 - k00;
+        x[z - 14] = (l11 - l00) * a2;
+        x[z - 15] = (l00 + l11) * (0.0 - a2);
+        _ogg_iter54(x, z);
+        _ogg_iter54(x, z - 8);
+        z -= 16;
+    }
+}
+
+// Decodes audio packet k into the channel buffers (each n samples, before overlap):
+// left and right are where its rising and falling windows start, len where it ends.
+bool _ogg_decode(*OggVorbis f, int k, *int pleft, *int pright, *int plen) {
+    _OggPacket* pk = &f._packets.data[k];
+    _ogg_assemble(f, pk);
+    _OggBits b = _OggBits{p: f._pkt, len: f._pktlen};
+    if (_ogg_get(&b, 1) != 0) return false;
+    int mi = (int)_ogg_get(&b, _ogg_ilog((int64)(f._nmodes - 1)));
+    if (b.eop || mi >= f._nmodes) return false;
+    _OggMode* m = &f._modes[mi];
+    int n = f._bs0;
+    bool prev = false;
+    bool next = false;
+    if (m.blockflag != 0) {
+        n = f._bs1;
+        prev = _ogg_get(&b, 1) != 0;
+        next = _ogg_get(&b, 1) != 0;
+    }
+    int bs0 = f._bs0;
+    int center = n >> 1;
+    int left = 0;
+    int right = center;
+    int len = n;
+    if (m.blockflag != 0 && !prev) left = (n - bs0) >> 2;
+    if (m.blockflag != 0 && !next) {
+        right = (n * 3 - bs0) >> 2;
+        len = (n * 3 + bs0) >> 2;
+    }
+    _OggMapping* map = &f._maps[m.mapping];
+    int n2 = n >> 1;
+    int nch = f.channels;
+    bool[256] zero;
+    bool[256] really;
+    for (ch in 0..nch) {
+        _OggFloor* g = &f._floors[map.sfloor[map.mux[ch]]];
+        zero[ch] = !_ogg_floor_decode(&b, f, g, f._finaly + ch * 256);
+        really[ch] = zero[ch];
+    }
+    for (i in 0..map.coupling) {
+        int mg = (int)map.mag[i];
+        int an = (int)map.ang[i];
+        if (!zero[mg] || !zero[an]) {
+            zero[mg] = false;
+            zero[an] = false;
+        }
+    }
+    for (ch in 0..nch) memset(f._buf + (int64)ch * (int64)f._bs1, 0, (int64)n2 * 4);
+    for (i in 0..map.submaps) {
+        int[256] chans;
+        bool[256] skip;
+        int count = 0;
+        for (j in 0..nch) {
+            if ((int)map.mux[j] == i) {
+                chans[count] = j;
+                skip[count] = zero[j];
+                count++;
+            }
+        }
+        _ogg_residue(&b, f, (int)map.sresidue[i], &chans[0], &skip[0], count, n2);
+    }
+    for (int i = map.coupling - 1; i >= 0; i--) {
+        *float mv = f._buf + (int64)map.mag[i] * (int64)f._bs1;
+        *float av = f._buf + (int64)map.ang[i] * (int64)f._bs1;
+        for (j in 0..n2) {
+            float m2 = 0.0;
+            float a2 = 0.0;
+            if (mv[j] > 0.0) {
+                if (av[j] > 0.0) {
+                    m2 = mv[j];
+                    a2 = mv[j] - av[j];
+                } else {
+                    a2 = mv[j];
+                    m2 = mv[j] + av[j];
+                }
+            } else if (av[j] > 0.0) {
+                m2 = mv[j];
+                a2 = mv[j] + av[j];
+            } else {
+                a2 = mv[j];
+                m2 = mv[j] - av[j];
+            }
+            mv[j] = m2;
+            av[j] = a2;
+        }
+    }
+    for (ch in 0..nch) {
+        *float v = f._buf + (int64)ch * (int64)f._bs1;
+        if (really[ch]) memset(v, 0, (int64)n2 * 4);
+        else _ogg_floor_apply(&f._floors[map.sfloor[map.mux[ch]]], f._finaly + ch * 256, v, n2);
+    }
+    for (ch in 0..nch) _ogg_imdct(f, f._buf + (int64)ch * (int64)f._bs1, n, m.blockflag);
+    *pleft = left;
+    *pright = right;
+    *plen = len;
+    return true;
+}
+
+// Decodes the next packet and overlaps it with the one before: its new frames are
+// _outcnt frames from _outfrom in the channel buffers, at _outpos in the stream. A packet
+// decoded with no packet before it (the first, or the first after a seek) gives only the
+// part of it that needs no overlap, from its center to where its falling window starts.
+void _ogg_step(*OggVorbis f) {
+    int k = f._next;
+    f._next++;
+    _OggPacket* pk = &f._packets.data[k];
+    f._outfrom = 0;
+    f._outcnt = 0;
+    int left = 0;
+    int right = 0;
+    int len = 0;
+    if (!_ogg_decode(f, k, &left, &right, &len)) {
+        // A packet that cannot be decoded leaves a gap that reads as silence.
+        f._prevlen = 0;
+        return;
+    }
+    int center = (pk.block != 0 ? f._bs1 : f._bs0) / 2;
+    int prev = f._prevlen;
+    if (prev > 0) {
+        *float w = prev * 2 == f._bs0 ? f._blk[0].win : f._blk[1].win;
+        for (ch in 0..f.channels) {
+            *float v = f._buf + (int64)ch * (int64)f._bs1;
+            *float pw = f._prevw + (int64)ch * (int64)(f._bs1 / 2);
+            for (j in 0..prev) v[left + j] = v[left + j] * w[j] + pw[j] * w[prev - 1 - j];
+        }
+    }
+    f._prevlen = len - right;
+    for (ch in 0..f.channels) {
+        *float v = f._buf + (int64)ch * (int64)f._bs1;
+        *float pw = f._prevw + (int64)ch * (int64)(f._bs1 / 2);
+        for (j in 0..len - right) pw[j] = v[right + j];
+    }
+    f._outfrom = prev > 0 ? left : center;
+    f._outcnt = right - f._outfrom;
+    f._outpos = pk.end - (int64)center + (int64)f._outfrom;
+}
