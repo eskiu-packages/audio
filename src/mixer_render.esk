@@ -1,0 +1,255 @@
+// mixer_render.esk: rendering the voices into frames, flat and binaural (part of mixer.esk, which imports it in order after the ones before it)
+
+float _sample(*Sound s, uint64 frame, int ch) {
+    int c = ch < s.channels ? ch : s.channels - 1;
+    return s.data[frame * (uint64)s.channels + (uint64)c];
+}
+
+// One frame of a sound voice into l and r (before its gains), then a step forward; false
+// when there is nothing to play.
+bool _voice_sound_frame(*Mixer self, _Voice* v, *float l, *float r) {
+    *Sound s = v.sound;
+    if (s.frames == 0) return false;
+    // A looping voice wraps from the sound's loop end to its loop start (the whole sound
+    // without loop points, or when it plays backwards).
+    uint64 ls = 0;
+    uint64 le = s.frames;
+    if (v.loop && !v.reverse && s.loop_end > s.loop_start && s.loop_end <= s.frames) {
+        ls = s.loop_start;
+        le = s.loop_end;
+    }
+    uint64 i0 = (uint64)v.pos;
+    double t = v.pos - (double)i0;
+    uint64 i1 = i0 + 1;
+    if (i1 >= le) i1 = v.loop ? ls : i0;
+    if (v.reverse) {
+        i0 = s.frames - 1 - i0;
+        i1 = s.frames - 1 - i1;
+    }
+    float l0 = _sample(s, i0, 0);
+    float l1 = _sample(s, i1, 0);
+    float r0 = _sample(s, i0, 1);
+    float r1 = _sample(s, i1, 1);
+    *l = l0 + (l1 - l0) * (float)t;
+    *r = r0 + (r1 - r0) * (float)t;
+    if (v.space == _SPACE_POINT) {
+        // a positioned sound is a point: its channels mixed to one
+        float c = (*l + *r) * 0.5;
+        *l = c;
+        *r = c;
+    } else if (v.space == _SPACE_FIELD && s.channels >= 4) {
+        // first-order AmbiX (W, Y, Z, X): a virtual cardioid toward each ear
+        float w0 = l0;
+        float w = w0 + (l1 - w0) * (float)t;
+        float y = r0 + (r1 - r0) * (float)t;
+        float z0 = _sample(s, i0, 2);
+        float z = z0 + (_sample(s, i1, 2) - z0) * (float)t;
+        float x0 = _sample(s, i0, 3);
+        float x = x0 + (_sample(s, i1, 3) - x0) * (float)t;
+        v.foa[0] = w;
+        v.foa[1] = y;
+        v.foa[2] = z;
+        v.foa[3] = x;
+        float side = v.kx * x + v.ky * y + v.kz * z;
+        *l = 0.5 * (w + side);
+        *r = 0.5 * (w - side);
+    }
+    v.pos = v.pos + v.step;
+    if (v.loop && v.pos >= (double)le) {
+        double span = (double)(le - ls);
+        double p = v.pos - (double)ls;
+        v.pos = (double)ls + (p - span * (double)(uint64)(p / span));
+    } else if (v.pos >= (double)s.frames) {
+        if (v.next != null && v.next.frames > 0) {
+            // What is left over carries into the next sound, at its rate.
+            double over = (v.pos - (double)s.frames) / (double)s.rate * (double)v.next.rate;
+            v.sound = v.next;
+            v.loop = v.next_loop;
+            v.next = null;
+            v.step = (double)v.pitch * (double)v.sound.rate / (double)self.rate;
+            v.pos = over < (double)v.sound.frames ? over : 0;
+        }
+        else v.ended = true;
+    }
+    return true;
+}
+
+// One frame of a stream. The source is asked for _MIX_CHUNK frames at a time, so the calls
+// it sees do not depend on how the mix is split into renders.
+bool _voice_source_frame(_Voice* v, *float l, *float r) {
+    if (v.buf_pos >= v.buf_len) {
+        if (v.src_done) return false;
+        int64 n = v.src.render(v.buf, _MIX_CHUNK);
+        if (n < 0) n = 0;
+        if (n > _MIX_CHUNK) n = _MIX_CHUNK;
+        v.src_done = v.src.done();
+        if (!v.src_done) {
+            for (i in n * 2.._MIX_CHUNK * 2) v.buf[i] = 0.0;
+            n = _MIX_CHUNK;
+        }
+        v.buf_len = n;
+        v.buf_pos = 0;
+        if (n == 0) return false;
+    }
+    *l = v.buf[v.buf_pos * 2];
+    *r = v.buf[v.buf_pos * 2 + 1];
+    v.buf_pos++;
+    if (v.src_done && v.buf_pos >= v.buf_len) v.ended = true;
+    return true;
+}
+
+// Writes frames stereo frames (2 * frames floats) of the mix into out and
+// advances every voice; voices that end are removed. Voices add in the
+// order they started.
+void Mixer_render(*Mixer self, *float out, int frames) {
+    if (self.spatial != null) {
+        _mixer_render_spatial(self, out, frames);
+        return;
+    }
+    double dt = 1.0 / (double)self.rate;
+    for (f in 0..frames) {
+        if (!self.manual_clock) _mixer_events(self);
+        for (b in 0..self.buses.size) {
+            _Bus* bus = &self.buses.data[b];
+            bus.eff = (float)bus.gain;
+            if (bus.parent >= 0 && bus.parent < b) bus.eff = bus.eff * self.buses.data[bus.parent].eff;
+        }
+        float sl = 0.0;
+        float sr = 0.0;
+        for (k in 0..self.voices.size) {
+            _Voice* v = &self.voices.data[k];
+            if (v.paused || v.ended) continue;
+            float l = 0.0;
+            float r = 0.0;
+            bool got = v.is_src ? _voice_source_frame(v, &l, &r) : _voice_sound_frame(self, v, &l, &r);
+            if (!got) {
+                v.ended = true;
+                continue;
+            }
+            v.played++;
+            float g = (float)v.env;
+            if (self.buses.size > 0) g = g * self.buses.data[v.bus].eff;
+            sl += l * v.left * g;
+            sr += r * v.right * g;
+        }
+        if (self.mono) {
+            sl = (sl + sr) * 0.5;
+            sr = sl;
+        }
+        float x = sl * self.volume;
+        float y = sr * self.volume;
+        out[f * 2] = x > 1.0 ? 1.0 : (x < -1.0 ? -1.0 : x);
+        out[f * 2 + 1] = y > 1.0 ? 1.0 : (y < -1.0 ? -1.0 : y);
+        if (!self.manual_clock) _mixer_tick(self, dt);
+    }
+    _mixer_sweep(self);
+    if (!self.manual_clock) _mixer_events(self);
+}
+
+// The mix with the spatial renderer (binaural, rooms): in blocks of up to 256 frames, the
+// voices in space encoded for it and the rest mixed in stereo as without it.
+void _mixer_render_spatial(*Mixer self, *float out, int frames) {
+    double dt = 1.0 / (double)self.rate;
+    *AudioSpatial sp = self.spatial;
+    int done = 0;
+    while (done < frames) {
+        int n = frames - done < 256 ? frames - done : 256;
+        AudioSpatial_begin(sp);
+        *float o = out + (int64)done * 2;
+        for (f in 0..n) {
+            if (!self.manual_clock) _mixer_events(self);
+            for (b in 0..self.buses.size) {
+                _Bus* bus = &self.buses.data[b];
+                bus.eff = (float)bus.gain;
+                if (bus.parent >= 0 && bus.parent < b) bus.eff = bus.eff * self.buses.data[bus.parent].eff;
+            }
+            float sl = 0.0;
+            float sr = 0.0;
+            for (k in 0..self.voices.size) {
+                _Voice* v = &self.voices.data[k];
+                if (v.paused || v.ended) continue;
+                float l = 0.0;
+                float r = 0.0;
+                bool got = v.is_src ? _voice_source_frame(v, &l, &r) : _voice_sound_frame(self, v, &l, &r);
+                if (!got) {
+                    v.ended = true;
+                    continue;
+                }
+                v.played++;
+                float g = (float)v.env;
+                if (self.buses.size > 0) g = g * self.buses.data[v.bus].eff;
+                if (v.space == _SPACE_POINT) {
+                    float mono = l * v.volume * v.space_gain * g;
+                    if (sp.has_room) sp.room_in[f] += l * v.volume * g * v.room_gain;
+                    if (sp.binaural) {
+                        AudioSpatial_add(sp, f, mono, &v.sh[0]);
+                        continue;
+                    }
+                } else if (v.space == _SPACE_FIELD && sp.binaural) {
+                    // W as it is; X, Y, Z turned into the listener's axes
+                    float vg = v.volume * g;
+                    float fx = v.foa[3];
+                    float fy = v.foa[1];
+                    float fz = v.foa[2];
+                    sp.amb[f] += v.foa[0] * vg;
+                    sp.amb[3 * 256 + f] += (v.field_m[0] * fx + v.field_m[1] * fy + v.field_m[2] * fz) * vg;
+                    sp.amb[1 * 256 + f] += (v.field_m[3] * fx + v.field_m[4] * fy + v.field_m[5] * fz) * vg;
+                    sp.amb[2 * 256 + f] += (v.field_m[6] * fx + v.field_m[7] * fy + v.field_m[8] * fz) * vg;
+                    continue;
+                }
+                sl += l * v.left * g;
+                sr += r * v.right * g;
+            }
+            o[f * 2] = sl;
+            o[f * 2 + 1] = sr;
+            if (!self.manual_clock) _mixer_tick(self, dt);
+        }
+        AudioSpatial_end(sp, n, o);
+        for (f in 0..n) {
+            float sl = o[f * 2];
+            float sr = o[f * 2 + 1];
+            if (self.mono) {
+                sl = (sl + sr) * 0.5;
+                sr = sl;
+            }
+            float x = sl * self.volume;
+            float y = sr * self.volume;
+            o[f * 2] = x > 1.0 ? 1.0 : (x < -1.0 ? -1.0 : x);
+            o[f * 2 + 1] = y > 1.0 ? 1.0 : (y < -1.0 ? -1.0 : y);
+        }
+        done += n;
+    }
+    _mixer_sweep(self);
+    if (!self.manual_clock) _mixer_events(self);
+}
+
+void _mixer_spatial_listener(*Mixer self) {
+    if (self.spatial == null) return;
+    AudioVec3 right = _listener_right(self);
+    float[3] r = {right.x, right.y, right.z};
+    float[3] u = {self.listener_up.x, self.listener_up.y, self.listener_up.z};
+    float[3] a = {self.listener_forward.x, self.listener_forward.y, self.listener_forward.z};
+    AudioSpatial_listener(self.spatial, self.listener.x, self.listener.y, self.listener.z, &r[0], &u[0], &a[0]);
+}
+
+void _mixer_spatial(*Mixer self) {
+    if (self.spatial == null) self.spatial = audio_spatial_new(self.rate);
+}
+
+// Renders sounds in space for headphones (ViroReact's binaural rendering, through Resonance
+// Audio): positioned sounds and sound fields are heard from where they are around the
+// listener's head, front and back, above and below, instead of panned between two speakers.
+void Mixer_set_binaural(*Mixer self, bool on) {
+    _mixer_spatial(self);
+    self.spatial.binaural = on;
+    for (i in 0..self.voices.size) _voice_space(self, &self.voices.data[i]);
+}
+
+// Puts the listener in a room (ViroReact's ViroSoundRoom): positioned sounds get the room's
+// early reflections and its reverb, from its size and materials; has false takes it away.
+void Mixer_set_room(*Mixer self, bool has, AudioRoom room) {
+    _mixer_spatial(self);
+    AudioSpatial_room(self.spatial, has, &room);
+    for (i in 0..self.voices.size) _voice_space(self, &self.voices.data[i]);
+    _mixer_spatial_listener(self);
+}
