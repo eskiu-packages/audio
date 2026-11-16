@@ -98,7 +98,7 @@ pause, stop, fades, buses and roles). The mixer asks it for 512 frames at a time
 voice once `done()` is true and those frames are played; a short block from a source that is
 not done plays silence for the rest. The source must live while it plays.
 
-`audio` does not depend on the [`nds`](https://github.com/eskiu-lang/nds) package; a program
+`audio` does not depend on the [`nds`](https://github.com/eskiu-packages/nds) package; a program
 that uses both plugs an SDAT sequence in with a struct of its own:
 
 ```eskiu

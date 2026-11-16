@@ -12,7 +12,7 @@ Guides and reference for audio. The [README](../README.md) has the overview.
 | Modules | macOS, Linux, Windows | iOS, Android | WebAssembly |
 |---|---|---|---|
 | `<audio/wav>`, `<audio/ogg>`, `<audio/mixer>` | yes | yes | yes |
-| `<audio/device>` (and `<audio>`, which imports it) | SDL3 | yes, in an [eskiu-lang/ui](https://github.com/eskiu-lang/ui) app | not yet |
+| `<audio/device>` (and `<audio>`, which imports it) | SDL3 | yes, in an [eskiu-packages/ui](https://github.com/eskiu-packages/ui) app | not yet |
 
 On a phone `<audio/device>` needs no SDL3: its native code (`native/`), which a ui app builds
 in, plays through a RemoteIO audio unit on iOS and AAudio on Android (Android 8 or later,

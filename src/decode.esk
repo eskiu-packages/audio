@@ -1,7 +1,7 @@
 // decode.esk: sound_load reads a sound file into a Sound: WAV (<audio/wav>) and Ogg Vorbis
 // (<audio/ogg>) on every platform, and on iOS and Android also what the system decodes
 // (MP3, AAC / M4A, FLAC; Opus on Android) through its own codecs (native/, built in by
-// eskiu-lang/ui apps). A file from the network is downloaded first (ui_fetch, <fetch>) and
+// eskiu-packages/ui apps). A file from the network is downloaded first (ui_fetch, <fetch>) and
 // loaded from disk.
 //
 //     Sound music = sound_load(path)?;

@@ -200,7 +200,7 @@ order), and the reverb.
 Sound_load reads a sound file into a Sound: WAV (`<audio/wav>`) and Ogg Vorbis
 (`<audio/ogg>`) on every platform, and on iOS and Android also what the system decodes
 (MP3, AAC / M4A, FLAC; Opus on Android) through its own codecs (native/, built in by
-eskiu-lang/ui apps). A file from the network is downloaded first (ui_fetch, `<fetch>`) and
+eskiu-packages/ui apps). A file from the network is downloaded first (ui_fetch, `<fetch>`) and
 loaded from disk.
 
 ```eskiu
@@ -233,7 +233,7 @@ bytes; the samples are copied, so d can be freed after.
 
 Sound output: SDL3 on macOS, Linux and Windows (a program that imports it
 links SDL3; `<audio/wav>` and `<audio/mixer>` alone do not), a RemoteIO audio unit on iOS and
-AAudio on Android (native/, built in by eskiu-lang/ui apps).
+AAudio on Android (native/, built in by eskiu-packages/ui apps).
 
 ```eskiu
 AudioDevice out = audio_open(48000)?;
