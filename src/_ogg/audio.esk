@@ -1,4 +1,4 @@
-// ogg_audio.esk: pages, packets and audio packets (part of ogg.esk, which imports it in order after the ones before it)
+// _ogg/audio.esk: pages, packets and audio packets (part of ogg.esk, which imports it in order after the ones before it)
 
 // ---------------------------------------------------------------------------------------
 // Pages and packets.

@@ -1,4 +1,4 @@
-// ogg_stream.esk: opening, reading, seeking and streams for the mixer (part of ogg.esk, which imports it in order after the ones before it)
+// _ogg/stream.esk: opening, reading, seeking and streams for the mixer (part of ogg.esk, which imports it in order after the ones before it)
 
 // ---------------------------------------------------------------------------------------
 // Opening, reading and seeking.

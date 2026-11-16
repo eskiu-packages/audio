@@ -371,6 +371,6 @@ int Mixer_count(*Mixer self) {
     return self.voices.size;
 }
 
-import "mixer_fades.esk";
-import "mixer_render.esk";
-import "mixer_space.esk";
+import "_mixer/fades.esk";
+import "_mixer/render.esk";
+import "_mixer/space.esk";

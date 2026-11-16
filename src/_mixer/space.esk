@@ -1,4 +1,4 @@
-// mixer_space.esk: sound in space, and freeing the mixer (part of mixer.esk, which imports it in order after the ones before it)
+// _mixer/space.esk: sound in space, and freeing the mixer (part of mixer.esk, which imports it in order after the ones before it)
 
 // --- sound in space ---
 

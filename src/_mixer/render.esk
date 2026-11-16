@@ -1,4 +1,4 @@
-// mixer_render.esk: rendering the voices into frames, flat and binaural (part of mixer.esk, which imports it in order after the ones before it)
+// _mixer/render.esk: rendering the voices into frames, flat and binaural (part of mixer.esk, which imports it in order after the ones before it)
 
 float _sample(*Sound s, uint64 frame, int ch) {
     int c = ch < s.channels ? ch : s.channels - 1;

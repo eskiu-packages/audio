@@ -147,6 +147,6 @@ float _ogg_float32(uint32 x) {
     return (float)(m * scale);
 }
 
-import "ogg_setup.esk";
-import "ogg_audio.esk";
-import "ogg_stream.esk";
+import "_ogg/setup.esk";
+import "_ogg/audio.esk";
+import "_ogg/stream.esk";

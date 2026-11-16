@@ -1,4 +1,4 @@
-// mixer_fades.esk: fades, buses, the music slots and the clock (part of mixer.esk, which imports it in order after the ones before it)
+// _mixer/fades.esk: fades, buses, the music slots and the clock (part of mixer.esk, which imports it in order after the ones before it)
 
 // A fade moves a gain linearly from where it is to a target over ms
 // milliseconds (at once for 0), at a fixed speed in gain per second.

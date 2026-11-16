@@ -1,4 +1,4 @@
-// ogg_setup.esk: the setup: codebooks, floors, residues, mappings and modes (part of ogg.esk, which imports it in order after the ones before it)
+// _ogg/setup.esk: the setup: codebooks, floors, residues, mappings and modes (part of ogg.esk, which imports it in order after the ones before it)
 
 // ---------------------------------------------------------------------------------------
 // The setup: codebooks, floors, residues, mappings and modes.
