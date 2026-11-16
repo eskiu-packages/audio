@@ -4,7 +4,7 @@ All notable changes to this package are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.4.1] - 2026-11-16
 
 ### Added
 
@@ -20,6 +20,11 @@ All notable changes to this package are documented here. The format follows
   `Mixer_set_rolloff`; `Mixer_play_field` plays a first-order AmbiX recording around the
   listener, turned by `Mixer_set_field_rotation`; `Mixer_set_listener` and
   `Mixer_set_listener_pose` place the listener.
+
+### Changed
+
+- The package moved to the eskiu-packages organization; the old URL redirects. The sources
+  are split into files by topic.
 
 ## [0.4.0]
 
@@ -45,7 +50,7 @@ All notable changes to this package are documented here. The format follows
 - `sound_load` reads `.ogg` files with `<audio/ogg>` on every platform (on Android they went
   through the system's codecs before).
 
-## [0.3.0] - 2026-11-07
+## [0.3.0]
 
 ### Added
 
