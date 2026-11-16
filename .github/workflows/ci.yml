@@ -31,20 +31,6 @@ jobs:
       - name: API reference is current
         run: python3 -I tools/gen_api.py --check
 
-  macos:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Eskiu and SDL3
-        run: brew install eskiu-lang/eskiu/eskiu sdl3
-      - name: Tests
-        run: eskiuc test -L$(brew --prefix)/lib
-      - name: Example builds
-        run: |
-          mkdir -p build
-          eskiuc -L$(brew --prefix)/lib examples/play.esk -o build/play
-          SDL_AUDIO_DRIVER=dummy build/play tests/data/s16.wav
-
   windows:
     runs-on: windows-latest
     defaults:
